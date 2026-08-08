@@ -158,6 +158,31 @@ entry:
   # E4. Breakout of an N-period high (long) or low (short) on the 1h chart.
   breakoutLookback: 24
 
+  # Entries are limit orders inside a band, not market orders. Maker is 2 bps
+  # against taker 5 bps (measured), and across ~40 trades that difference is
+  # real money at 320 of capital. The band is expressed in ATR so it scales
+  # with each instrument's volatility.
+  bandAtrFraction: 0.25
+
+  # How long a published signal remains actionable. Long enough for the copy
+  # executor to act, short enough that a stale signal cannot be filled into a
+  # market that has already moved.
+  validityHours: 4
+
+  # Conviction is a composite, scored 0-100, gated at signals.minConviction.
+  # Weights must sum to 1. Confidence decides WHETHER to trade, never how much
+  # (Law 9) — these weights never touch position size.
+  convictionWeights:
+    momentum: 0.35 # rank within the surviving universe
+    trendStrength: 0.25 # ADX above the regime floor
+    volume: 0.25 # expansion beyond the regime floor
+    multiTimeframe: 0.15 # 4h agreeing with the 1h signal
+
+  # Saturation points for the score components. Beyond these, more is not
+  # better — an ADX of 80 is not twice as tradable as 40, it is usually late.
+  adxSaturation: 45
+  volumeTrendSaturation: 3.0
+
 exits:
   # Stops are ATR-scaled, never a fixed percentage. ATR adapts to each
   # instrument's volatility, which is what makes a 3% stop on BTC and a 9% stop

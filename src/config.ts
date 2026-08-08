@@ -120,6 +120,22 @@ export const configSchema = z
     entry: z
       .object({
         breakoutLookback: z.number().int().positive(),
+        bandAtrFraction: positive,
+        validityHours: positive,
+        convictionWeights: z
+          .object({
+            momentum: fraction,
+            trendStrength: fraction,
+            volume: fraction,
+            multiTimeframe: fraction,
+          })
+          .strict()
+          .refine((w) => {
+            const sum = w.momentum + w.trendStrength + w.volume + w.multiTimeframe;
+            return Math.abs(sum - 1) < 1e-9;
+          }, 'conviction weights must sum to 1'),
+        adxSaturation: positive,
+        volumeTrendSaturation: positive,
       })
       .strict(),
 

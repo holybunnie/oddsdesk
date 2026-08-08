@@ -1,6 +1,6 @@
 # AlphaGate — Handoff
 
-**Last updated:** 2026-08-08
+**Last updated:** 2026-08-08 (session 2 — E5 complete, E4 written but untested)
 **Competition:** OKX.AI Hackathon Season 1
 **Registration closes:** Aug 11 12:00 UTC+8 — **the only irreversible deadline**
 **Trading window:** Aug 11 12:00 → Aug 25 12:00 UTC+8
@@ -10,14 +10,20 @@
 
 ## 1. Where things stand in one paragraph
 
-The venue-agnostic core is built and tested (88 tests, typecheck clean). The
-signal scanner runs end to end against the live OKX venue and produces real
-candidates. Credentials are installed on the box and the order path is verified
-to reach the venue's margin check. Nothing can place a live order yet, by
-design: `maxLeverage` is unset until the stop kill test is observed, and
-`computeSize()` refuses to produce a position while it is unset. The two things
-blocking progress are both external — funding the sub-account, and registering
-the ASP.
+The venue-agnostic core is built and tested (**119 tests, typecheck clean**).
+The signal scanner runs end to end against the live OKX venue and produces real
+candidates; E5 exits are complete and exhaustively tested; E4 entry is written
+but **has no tests yet**. Credentials are installed on the box and the order
+path is verified to reach the venue's margin check. Nothing can place a live
+order yet, by design: `maxLeverage` is unset until the stop kill test is
+observed, and `computeSize()` refuses to produce a position while it is unset.
+The two things blocking progress are both external — funding the sub-account,
+and registering the ASP.
+
+**Time check:** registration closes Aug 11 12:00 UTC+8. The ASP needs ~24h of
+review with the service online throughout, so the practical deadline for
+starting registration is roughly **Aug 10 midday**. Everything in section 6 can
+be built in parallel; registration cannot be started late.
 
 ---
 
@@ -147,6 +153,49 @@ E1 universe filter, E2 regime gate, E3 cross-sectional ranking. Regime gate runs
 before ranking is acted on, so chop is never ranked against trend. Extremes
 taken disjointly so a small universe can't produce a simultaneous long+short.
 
+### `src/signal/exits.ts` — E5, complete (31 tests)
+Pure function of position state and market state returning decisions the
+executor carries out. No venue needed, so the whole exit path is exhaustively
+tested.
+
+- **`ratchetStop()` returns the existing stop when asked to widen.** "Never move
+  a stop away from price" is a move the code cannot make, not a rule it follows.
+- **Chandelier anchors to the extreme since entry**, not current price —
+  anchoring to price would loosen the stop on every pullback.
+- **R is anchored to the initial stop.** Measuring against the current stop
+  would divide by zero at breakeven and inflate every R multiple before that.
+  This matters: R is the metric the daily attribution uses to detect broken
+  exits, so an inflated R would hide the very failure it exists to catch.
+- Evaluation order is fixed, first terminal action wins: stop hit → time stop →
+  scale-out → breakeven → trail. A losing position yields nothing but `hold`.
+- 25% off at +2R (not 50%) so three-quarters of the tail survives; breakeven at
+  the same point; trail 3× ATR tightening to 2.5× past +4R; time stop at 12h
+  without +1R; 4h cooldown after a stop-out.
+
+The key test walks a position from entry through +5R and back through a
+pullback, feeding each plan's stop into the next step, asserting the stop never
+widens at any point.
+
+### `src/signal/entry.ts` — E4, **WRITTEN BUT UNTESTED**
+> **Do not trust this module yet.** It compiles and typechecks, but it has zero
+> tests and has never been run against real candles. Writing its test file is
+> the first task of the next session.
+
+Breakout of the N-period extreme on the confirmed 1h bar, plus a 0–100
+composite conviction score gated at 75.
+
+- Conviction components (momentum rank, ADX above the regime floor, volume
+  expansion, 4h agreement) each **saturate**, so one extreme reading cannot drag
+  a mediocre candidate over the line on its own.
+- Entry is a **limit band** in ATR units, not a market order — maker is 2 bps
+  against taker 5 bps (measured), and chasing gives that edge away.
+- Target is **derived from the stop** at the minimum payoff ratio, so a signal
+  cannot exist without a 3:1 target.
+- Rejections carry **every** reason, not the first — the daily attribution needs
+  to see whether the gate rejects for one dominant cause, which is how you learn
+  the threshold is misplaced.
+- Conviction never touches size (Law 9).
+
 ### `src/scripts/scan.ts`
 Live observability tool. Run it any time:
 
@@ -199,20 +248,30 @@ candidates passed E2**; regime favourable.
 
 ### Buildable now, no funding needed
 
-5. **E4 — entry trigger and conviction score.** Breakout of an N-period high/low
-   on 1h, only for instruments in the extreme decile that passed E2. Conviction
-   0–100 composite; trade only above 75; target ~2 trades/day.
-6. **E5 — exits.** Where the competition is won. ATR stop at 2.0×, 25% off at
-   +2R, stop to breakeven, Chandelier trail at 3×ATR tightening to 2.5× past
-   +4R, time stop at 12h without +1R, no re-entry for 4h after a stop-out.
-7. **Trade Kit execution adapter** — implements `ExecutionAdapter` against the
-   `okx` CLI. Interface already exists; this is the concrete class.
-8. **Copy executor** — the deliberately dumb process. Parses published signals,
+**Start here next session:**
+
+5. **Test E4.** `src/signal/entry.ts` exists and typechecks but has no tests.
+   Cover at minimum: a bar cannot break its own level; conviction components
+   saturate; a candidate below threshold is rejected with reasons; the target
+   sits at exactly the minimum payoff ratio; cooldown blocks re-entry; the
+   entry band brackets the breakout level on the correct side.
+6. **Wire E4 into `scan.ts`** so the live scanner prints actual entry
+   candidates with conviction scores. This is also the sanity check on trade
+   frequency — if it produces far more than ~2 signals a day across the
+   universe, the threshold is too loose. That is a tuning signal, not a good day.
+7. **Signal formatting and `validateSignal()`.** Max 200 chars, exact
+   `[Perpetual Signal]` header, absolute prices, size as a percentage, real
+   instrument. Hard gate before delivery — never skip-and-continue. Assert
+   `generated == validated == delivered + rejected` every cycle.
+8. **Trade Kit execution adapter** — implements `ExecutionAdapter` against the
+   `okx` CLI. Interface already exists; this is the concrete class. Note the CLI
+   needs `--profile okx-sub` and the IPv4 `NODE_OPTIONS` on every call.
+9. **Copy executor** — the deliberately dumb process. Parses published signals,
    deduplicates, checks positions and budget, submits, reconciles. **No strategy
    logic and no discretion** — that separation is what makes Law 6 structural.
-9. **Server hardening** — systemd units with `MemoryMax`, ufw, NTP, alerts,
-   pending reboot (`libc6` + kernel update outstanding).
-10. **Leaderboard parser** — Aug 11 only, against the real page.
+10. **Server hardening** — systemd units with `MemoryMax`, ufw, NTP, alerts,
+    pending reboot (`libc6` + kernel update outstanding).
+11. **Leaderboard parser** — Aug 11 only, against the real page.
 
 ---
 
