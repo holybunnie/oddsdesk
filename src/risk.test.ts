@@ -1,13 +1,11 @@
 /**
  * Law 7: a safety mechanism that has never fired in a test does not exist.
  *
- * Every test below drives a refusal path to an actual throw. Tests that only
- * assert the happy case would leave the gates unproven, which is the state the
- * spec explicitly forbids.
+ * Every test below drives a refusal path to an actual throw.
  */
 
 import { describe, expect, it } from 'vitest';
-import { loadConfig } from './config.js';
+import { ConfigError, loadConfig, requireMaxLeverage, assertIsolatedMargin, type Config } from './config.js';
 import {
   assertAboveEligibilityFloor,
   assertNotAddingToLoser,
@@ -17,11 +15,65 @@ import {
   governorAction,
   RiskRefusal,
   type EquityState,
+  type OpenRisk,
+  type SizingRequest,
 } from './risk.js';
 
-const config = loadConfig('config/default.yaml');
+/** The shipped config deliberately has no maxLeverage until verification writes it. */
+const unverified = loadConfig('config/default.yaml');
+
+/** Stands in for the post-verification config: venue-held stops confirmed. */
+const config: Config = {
+  ...unverified,
+  execution: { ...unverified.execution, maxLeverage: 5 },
+};
 
 const flat: EquityState = { equityUsdt: 320, peakEquityUsdt: 320 };
+
+const request = (overrides: Partial<SizingRequest> = {}): SizingRequest => ({
+  stage: 1,
+  equity: flat,
+  openRisk: [],
+  correlationGroup: 'btc-beta',
+  entryPrice: 100,
+  stopPrice: 99,
+  targetPrice: 103,
+  side: 'long',
+  ...overrides,
+});
+
+const held = (instrument: string, correlationGroup: string, riskUsdt: number): OpenRisk => ({
+  instrument,
+  correlationGroup,
+  riskUsdt,
+});
+
+describe('maxLeverage must be verified before any order', () => {
+  it('throws while unset rather than defaulting', () => {
+    expect(() => requireMaxLeverage(unverified)).toThrow(ConfigError);
+    expect(() => requireMaxLeverage(unverified)).toThrow(/stop verification/);
+  });
+
+  it('blocks sizing entirely while unset', () => {
+    // Not a warning. Nothing can be sized until the kill test has been observed.
+    expect(() => computeSize(unverified, request())).toThrow(/maxLeverage is not set/);
+  });
+
+  it('returns the written value once verification has set it', () => {
+    expect(requireMaxLeverage(config)).toBe(5);
+  });
+});
+
+describe('isolated margin', () => {
+  it('passes on the shipped config', () => {
+    expect(() => assertIsolatedMargin(config)).not.toThrow();
+  });
+
+  it('refuses cross margin', () => {
+    const cross: Config = { ...config, execution: { ...config.execution, marginMode: 'cross' } };
+    expect(() => assertIsolatedMargin(cross)).toThrow(/isolated margin is mandatory/);
+  });
+});
 
 describe('stage determination', () => {
   it('starts in stage 1 at the principal base', () => {
@@ -37,19 +89,14 @@ describe('stage determination', () => {
   });
 
   it('refuses stage 3 when rank data is unavailable, even at high equity', () => {
-    // Defending a rank you cannot currently measure is guessing.
     expect(determineStage(config, { equityUsdt: 900, peakEquityUsdt: 900 }, null)).toBe(2);
   });
 });
 
 describe('drawdown governor', () => {
-  it('reports no drawdown at the peak', () => {
-    expect(drawdownFromPeak(flat)).toBe(0);
-  });
-
   it('measures from peak, not from start', () => {
-    // Equity is above the 320 start but 25% below a 800 peak. Measuring from
-    // start would report a gain and size normally; that is the DeepSeek failure.
+    // Above the 320 start but 25% below an 800 peak. Measuring from start would
+    // report a gain and size normally; that is the DeepSeek give-back.
     const state: EquityState = { equityUsdt: 600, peakEquityUsdt: 800 };
     expect(drawdownFromPeak(state)).toBeCloseTo(0.25, 10);
     expect(governorAction(config, state, 2)).toBe('flatAndHalt');
@@ -57,117 +104,140 @@ describe('drawdown governor', () => {
 
   it('escalates through the stage-1 bands', () => {
     const at = (equityUsdt: number) => governorAction(config, { equityUsdt, peakEquityUsdt: 1000 }, 1);
-    expect(at(900)).toBe('normal'); // -10%
-    expect(at(800)).toBe('halveSizing'); // -20%, past 18%
-    expect(at(700)).toBe('flatAndHalt'); // -30%, past 28%
-    expect(at(600)).toBe('stopForCompetition'); // -40%, past 38%
+    expect(at(900)).toBe('normal');
+    expect(at(800)).toBe('halveSizing');
+    expect(at(700)).toBe('flatAndHalt');
+    expect(at(600)).toBe('stopForCompetition');
   });
 
   it('runs tighter in stage 3 than stage 1 at identical drawdown', () => {
-    const state: EquityState = { equityUsdt: 880, peakEquityUsdt: 1000 }; // -12%
+    const state: EquityState = { equityUsdt: 880, peakEquityUsdt: 1000 };
     expect(governorAction(config, state, 1)).toBe('normal');
     expect(governorAction(config, state, 3)).toBe('flatAndHalt');
   });
+
+  it('refuses to size once the governor has halted', () => {
+    expect(() =>
+      computeSize(config, { ...request({ stage: 2 }), equity: { equityUsdt: 700, peakEquityUsdt: 1000 } }),
+    ).toThrow(/no new positions/);
+  });
 });
 
-describe('H2 — payoff ratio enforcement', () => {
+describe('payoff ratio enforcement', () => {
   it('accepts a 3:1 setup', () => {
-    const result = computeSize(config, {
-      stage: 1,
-      equity: flat,
-      entryPrice: 100,
-      stopPrice: 99,
-      targetPrice: 103,
-      side: 'long',
-    });
-    expect(result.targetStopRatio).toBeCloseTo(3, 10);
+    expect(computeSize(config, request()).targetStopRatio).toBeCloseTo(3, 10);
   });
 
   it('refuses a 2:1 setup', () => {
-    expect(() =>
-      computeSize(config, {
-        stage: 1,
-        equity: flat,
-        entryPrice: 100,
-        stopPrice: 99,
-        targetPrice: 102,
-        side: 'long',
-      }),
-    ).toThrow(/below the required 3:1/);
+    expect(() => computeSize(config, request({ targetPrice: 102 }))).toThrow(/below the required 3:1/);
   });
 
   it('refuses a long whose stop sits above entry', () => {
-    expect(() =>
-      computeSize(config, {
-        stage: 1,
-        equity: flat,
-        entryPrice: 100,
-        stopPrice: 101,
-        targetPrice: 110,
-        side: 'long',
-      }),
-    ).toThrow(RiskRefusal);
+    expect(() => computeSize(config, request({ stopPrice: 101, targetPrice: 110 }))).toThrow(RiskRefusal);
   });
 });
 
-describe('H3 — fixed fractional sizing', () => {
-  it('risks the identical fraction of equity regardless of stop distance', () => {
-    const tight = computeSize(config, {
-      stage: 1,
-      equity: flat,
-      entryPrice: 100,
-      stopPrice: 99,
-      targetPrice: 105,
-      side: 'long',
-    });
-    const wide = computeSize(config, {
-      stage: 1,
-      equity: flat,
-      entryPrice: 100,
-      stopPrice: 90,
-      targetPrice: 150,
-      side: 'long',
-    });
+describe('fixed fractional sizing', () => {
+  it('risks the identical fraction regardless of stop distance', () => {
+    const tight = computeSize(config, request({ targetPrice: 105 }));
+    const wide = computeSize(config, request({ stopPrice: 90, targetPrice: 150 }));
 
-    // Identical risk, different notional. This is the property whose absence
-    // produced -62.7% in Alpha Arena.
     expect(tight.riskUsdt).toBeCloseTo(wide.riskUsdt, 10);
     expect(tight.riskUsdt).toBeCloseTo(320 * 0.02, 10);
     expect(wide.notionalUsdt).toBeLessThan(tight.notionalUsdt);
   });
 
   it('halves risk when the governor says halveSizing', () => {
-    const state: EquityState = { equityUsdt: 800, peakEquityUsdt: 1000 }; // -20%, stage 1
     const result = computeSize(config, {
-      stage: 1,
-      equity: state,
-      entryPrice: 100,
-      stopPrice: 99,
-      targetPrice: 105,
-      side: 'long',
+      ...request({ targetPrice: 105 }),
+      equity: { equityUsdt: 800, peakEquityUsdt: 1000 },
     });
     expect(result.governor).toBe('halveSizing');
     expect(result.riskFraction).toBeCloseTo(0.01, 10);
   });
 
-  it('refuses to size at all once the governor has halted', () => {
-    expect(() =>
-      computeSize(config, {
-        stage: 2,
-        equity: { equityUsdt: 700, peakEquityUsdt: 1000 },
-        entryPrice: 100,
-        stopPrice: 99,
-        targetPrice: 105,
-        side: 'long',
-      }),
-    ).toThrow(/no new positions/);
+  it('exposes no override path for risk', () => {
+    // Structural, not advisory. If someone adds a multiplier parameter this fails.
+    expect(computeSize.length).toBe(2);
+  });
+});
+
+describe('leverage is an output, not an input', () => {
+  it('reports emergent leverage well under the cap on a normal stop', () => {
+    // 2% risk with a 1% stop distance is 2x notional. The cap is nowhere near.
+    const result = computeSize(config, request({ targetPrice: 105 }));
+    expect(result.leverage).toBeCloseTo(2, 6);
+    expect(result.leverage).toBeLessThan(requireMaxLeverage(config));
   });
 
-  it('exposes no override path for risk', () => {
-    // Structural, not advisory: computeSize takes exactly (config, request) and
-    // SizingRequest has no multiplier, confidence or override field. If someone
-    // adds one, this assertion on the function arity fails and the review catches it.
-    expect(computeSize.length).toBe(2);
+  it('rejects a pathologically tight stop rather than sizing into it', () => {
+    // A stop a hair from entry produces enormous size at identical nominal
+    // risk. This is exactly what the cap exists to catch.
+    expect(() => computeSize(config, request({ stopPrice: 99.9, targetPrice: 101 }))).toThrow(
+      /leverage against a 5x cap/,
+    );
+  });
+});
+
+describe('portfolio heat and correlation caps', () => {
+  it('permits a position that keeps heat under the cap', () => {
+    const result = computeSize(config, {
+      ...request({ targetPrice: 105 }),
+      openRisk: [held('ETH-PERP', 'eth-beta', 6.4)],
+    });
+    // 6.4 held + 6.4 new = 12.8 on 320 equity = 4%, under the 6% cap.
+    expect(result.heatAfter).toBeCloseTo(0.04, 6);
+  });
+
+  it('refuses when heat would breach the cap', () => {
+    // This is the control that would have saved the model holding six losing shorts.
+    expect(() =>
+      computeSize(config, {
+        ...request({ targetPrice: 105 }),
+        openRisk: [held('ETH-PERP', 'eth-beta', 9.0), held('SOL-PERP', 'high-beta-alt', 9.0)],
+      }),
+    ).toThrow(/portfolio heat would reach/);
+  });
+
+  it('lets a position trailed to breakeven free capacity', () => {
+    // Risk still live is what counts, not the risk originally taken.
+    const result = computeSize(config, {
+      ...request({ targetPrice: 105 }),
+      openRisk: [held('ETH-PERP', 'eth-beta', 0), held('SOL-PERP', 'high-beta-alt', 0)],
+    });
+    expect(result.heatAfter).toBeCloseTo(0.02, 6);
+  });
+
+  it('refuses a fourth concurrent position', () => {
+    expect(() =>
+      computeSize(config, {
+        ...request({ targetPrice: 105 }),
+        openRisk: [
+          held('ETH-PERP', 'eth-beta', 0),
+          held('SOL-PERP', 'high-beta-alt', 0),
+          held('DOGE-PERP', 'high-beta-alt', 0),
+        ],
+      }),
+    ).toThrow(/already holding 3 positions/);
+  });
+
+  it('refuses a third position in the same correlation group', () => {
+    // Three high-beta alts is one trade wearing three hats.
+    expect(() =>
+      computeSize(config, {
+        ...request({ targetPrice: 105, correlationGroup: 'high-beta-alt' }),
+        openRisk: [held('SOL-PERP', 'high-beta-alt', 0), held('DOGE-PERP', 'high-beta-alt', 0)],
+      }),
+    ).toThrow(/correlation group "high-beta-alt"/);
+  });
+
+  it('permits a second position in a different group', () => {
+    expect(() =>
+      computeSize(config, {
+        ...request({ targetPrice: 105, correlationGroup: 'btc-beta' }),
+        openRisk: [held('SOL-PERP', 'high-beta-alt', 0), held('DOGE-PERP', 'high-beta-alt', 0)],
+      }),
+    ).not.toThrow();
   });
 });
 

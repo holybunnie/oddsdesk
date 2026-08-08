@@ -18,7 +18,7 @@
  */
 
 import type { Config, Stage } from './config.js';
-import { drawdownBandForStage, riskFractionForStage } from './config.js';
+import { drawdownBandForStage, requireMaxLeverage, riskFractionForStage } from './config.js';
 
 export type GovernorAction = 'normal' | 'halveSizing' | 'flatAndHalt' | 'stopForCompetition';
 
@@ -88,9 +88,25 @@ export function governorAction(config: Config, equity: EquityState, stage: Stage
   return 'normal';
 }
 
+/**
+ * An open position's contribution to portfolio heat.
+ *
+ * `riskUsdt` is what is still at risk *now* — distance from the current stop,
+ * not the original one. A position trailed to breakeven contributes zero heat,
+ * which is what makes room for the next trade honestly rather than by fiat.
+ */
+export interface OpenRisk {
+  readonly instrument: string;
+  readonly correlationGroup: string;
+  readonly riskUsdt: number;
+}
+
 export interface SizingRequest {
   readonly stage: Stage;
   readonly equity: EquityState;
+  /** Every currently open position. Empty array means flat. */
+  readonly openRisk: readonly OpenRisk[];
+  readonly correlationGroup: string;
   /** Entry price in quote units. */
   readonly entryPrice: number;
   /** Stop price in quote units. Mandatory — H2 admits no stopless entry. */
@@ -110,6 +126,13 @@ export interface SizingResult {
   readonly riskFraction: number;
   readonly targetStopRatio: number;
   readonly governor: GovernorAction;
+  /**
+   * Realised leverage. EMERGENT — it falls out of stop distance and is never
+   * chosen. maxLeverage is a cap that rejects the trade, never a target.
+   */
+  readonly leverage: number;
+  /** Portfolio heat after this position is added, as a fraction of equity. */
+  readonly heatAfter: number;
 }
 
 /**
@@ -121,7 +144,7 @@ export interface SizingResult {
  * off notional instead is how a wide stop quietly becomes a large loss.
  */
 export function computeSize(config: Config, request: SizingRequest): SizingResult {
-  const { stage, equity, entryPrice, stopPrice, targetPrice, side } = request;
+  const { stage, equity, entryPrice, stopPrice, targetPrice, side, openRisk, correlationGroup } = request;
 
   if (!Number.isFinite(entryPrice) || entryPrice <= 0) {
     throw new RiskRefusal('bad_entry', `entry price must be a positive finite number, got ${entryPrice}`);
@@ -171,6 +194,25 @@ export function computeSize(config: Config, request: SizingRequest): SizingResul
     );
   }
 
+  // Position count and correlation limits. Crypto perps correlate around 0.8,
+  // so three longs is one trade wearing three hats — these caps are what stop a
+  // "diversified" book being a single concentrated bet.
+  if (openRisk.length >= config.risk.maxConcurrentPositions) {
+    throw new RiskRefusal(
+      'max_positions',
+      `already holding ${openRisk.length} positions (limit ${config.risk.maxConcurrentPositions})`,
+    );
+  }
+
+  const inGroup = openRisk.filter((p) => p.correlationGroup === correlationGroup).length;
+  if (inGroup >= config.risk.maxPositionsPerCorrelationGroup) {
+    throw new RiskRefusal(
+      'correlation_group',
+      `already holding ${inGroup} positions in correlation group "${correlationGroup}" ` +
+        `(limit ${config.risk.maxPositionsPerCorrelationGroup})`,
+    );
+  }
+
   const baseFraction = riskFractionForStage(config, stage);
   const riskFraction = governor === 'halveSizing' ? baseFraction / 2 : baseFraction;
 
@@ -179,10 +221,35 @@ export function computeSize(config: Config, request: SizingRequest): SizingResul
     throw new RiskRefusal('no_equity', `equity ${equity.equityUsdt} leaves nothing to risk`);
   }
 
+  // Portfolio heat. Measured against risk still live on open positions, so a
+  // position trailed to breakeven frees capacity honestly rather than by fiat.
+  const existingHeatUsdt = openRisk.reduce((sum, p) => sum + p.riskUsdt, 0);
+  const heatAfter = (existingHeatUsdt + riskUsdt) / equity.equityUsdt;
+  if (heatAfter > config.risk.maxPortfolioHeat) {
+    throw new RiskRefusal(
+      'portfolio_heat',
+      `portfolio heat would reach ${(heatAfter * 100).toFixed(2)}% against a ` +
+        `${(config.risk.maxPortfolioHeat * 100).toFixed(2)}% cap`,
+    );
+  }
+
   const size = riskUsdt / stopDistance;
   const notionalUsdt = size * entryPrice;
 
-  return { size, notionalUsdt, riskUsdt, riskFraction, targetStopRatio, governor };
+  // Leverage is an OUTPUT. The cap rejects a pathological stop-distance
+  // calculation — a stop placed a hair from entry produces enormous size at
+  // identical nominal risk, and that is precisely what the cap is for.
+  const leverage = notionalUsdt / equity.equityUsdt;
+  const maxLeverage = requireMaxLeverage(config);
+  if (leverage > maxLeverage) {
+    throw new RiskRefusal(
+      'leverage_cap',
+      `stop distance implies ${leverage.toFixed(2)}x leverage against a ${maxLeverage}x cap — ` +
+        'the stop is too tight for this risk fraction, not a reason to raise the cap',
+    );
+  }
+
+  return { size, notionalUsdt, riskUsdt, riskFraction, targetStopRatio, governor, leverage, heatAfter };
 }
 
 /**

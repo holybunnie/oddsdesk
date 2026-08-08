@@ -4,8 +4,9 @@
  * Two rules drive the shape of this module:
  *
  *  - Law 1: venue facts are discovered at runtime, never typed into source.
- *    Policy lives in config/default.yaml; venue facts live in runtime profiles
- *    written by the verification probes.
+ *    Policy lives in config/default.yaml; fee tiers, tick size, lot size,
+ *    minimum notional and per-instrument leverage limits live in the runtime
+ *    profile written by the Day-0 verification.
  *  - Law 3: fail loudly. There is no default-on-missing anywhere in this file.
  *    A missing value throws at load, not at 3am with money on the book.
  */
@@ -30,10 +31,7 @@ const drawdownBandSchema = z
     'drawdown bands must increase: halveSizing < flatAndHalt12h < stopForCompetition',
   );
 
-const stageKeyed = <T extends z.ZodTypeAny>(inner: T) =>
-  z
-    .object({ 1: inner, 2: inner, 3: inner })
-    .strict();
+const stageKeyed = <T extends z.ZodTypeAny>(inner: T) => z.object({ 1: inner, 2: inner, 3: inner }).strict();
 
 export const configSchema = z
   .object({
@@ -41,16 +39,6 @@ export const configSchema = z
       .object({
         principalBaseUsdt: positive,
         eligibilityFloorUsdt: positive,
-        buckets: z
-          .object({
-            gasReserveUsdt: positive,
-            polymarketUsdt: positive,
-            tradeKitUsdt: positive,
-          })
-          .strict(),
-        initialDeploymentFraction: fraction,
-        initialDeploymentDays: z.number().int().positive(),
-        gasAlertFraction: fraction,
       })
       .strict()
       .refine(
@@ -61,53 +49,102 @@ export const configSchema = z
     risk: z
       .object({
         riskFractionByStage: stageKeyed(fraction),
+        maxPortfolioHeat: fraction,
+        maxConcurrentPositions: z.number().int().positive(),
+        maxPositionsPerCorrelationGroup: z.number().int().positive(),
         drawdownGovernor: stageKeyed(drawdownBandSchema),
         haltDurationHours: positive,
         stage2EquityMultiple: z.number().gt(1),
         minTargetStopRatio: z.number().gte(1),
-        trailAfterR: positive,
         maxFeedStalenessSeconds: positive,
         maxLeaderboardStalenessMinutes: positive,
         reconcileIntervalSeconds: positive,
       })
-      .strict(),
+      .strict()
+      .refine(
+        (r) => r.maxPositionsPerCorrelationGroup <= r.maxConcurrentPositions,
+        'maxPositionsPerCorrelationGroup cannot exceed maxConcurrentPositions',
+      ),
 
-    engines: z
+    execution: z
       .object({
-        disableAfterDays: z.number().int().positive(),
-        disableAfterTrades: z.number().int().positive(),
-      })
-      .strict(),
-
-    routeB: z
-      .object({
-        armed: z.boolean(),
+        // Isolated always: cross margin lets one bad position consume the
+        // equity backing every other. Enumerated rather than free text so a
+        // typo cannot silently select cross.
+        marginMode: z.enum(['isolated', 'cross']),
         // Absent until the Part IX stop verification writes it. Deliberately
         // optional in the schema and deliberately fatal in requireMaxLeverage().
         maxLeverage: positive.optional(),
-        minConfidence: z.number().min(0).max(100),
-        targetTradesPerDay: positive,
         feeBudgetFraction: fraction,
+      })
+      .strict(),
+
+    signals: z
+      .object({
+        minConviction: z.number().min(0).max(100),
+        targetTradesPerDay: positive,
+        minInstrumentsPassingRegime: z.number().int().positive(),
+      })
+      .strict(),
+
+    exits: z
+      .object({
+        atrPeriod: z.number().int().positive(),
+        initialStopAtrMultiple: positive,
+        scaleOutAtR: positive,
+        scaleOutFraction: fraction,
+        breakevenAtR: positive,
+        chandelierAtrMultiple: positive,
+        tightenTrailAtR: positive,
+        tightenedChandelierAtrMultiple: positive,
+        timeStopHours: positive,
+        timeStopRequiresR: positive,
         minHoldHours: positive,
         maxHoldHours: positive,
-        watchdog: z
-          .object({
-            heartbeatIntervalSeconds: positive,
-            staleFlattenSeconds: positive,
-          })
-          .strict(),
+        reentryCooldownHours: positive,
       })
       .strict()
-      .refine((r) => r.minHoldHours < r.maxHoldHours, 'minHoldHours must be below maxHoldHours'),
+      .refine((e) => e.minHoldHours < e.maxHoldHours, 'minHoldHours must be below maxHoldHours')
+      .refine(
+        (e) => e.tightenedChandelierAtrMultiple < e.chandelierAtrMultiple,
+        'the tightened trail must be tighter than the initial trail',
+      )
+      .refine(
+        (e) => e.tightenTrailAtR > e.scaleOutAtR,
+        'the trail tightens after the scale-out, not before it',
+      ),
+
+    pyramiding: z
+      .object({
+        enabled: z.boolean(),
+        maxAdds: z.number().int().nonnegative(),
+        addSizeMultiples: z.array(positive).min(1),
+      })
+      .strict()
+      .refine(
+        (p) => p.addSizeMultiples.every((m, i, a) => i === 0 || m < (a[i - 1] ?? Infinity)),
+        'addSizeMultiples must strictly decrease — equal or growing adds are over-leveraging in disguise',
+      )
+      .refine(
+        (p) => p.addSizeMultiples.length >= p.maxAdds + 1,
+        'addSizeMultiples needs an entry for the initial entry plus every add',
+      ),
+
+    attribution: z
+      .object({
+        minRealisedPayoffRatio: positive,
+        payoffRatioMinTrades: z.number().int().positive(),
+      })
+      .strict(),
 
     ledger: z.object({ path: z.string().min(1) }).strict(),
     killSwitch: z.object({ path: z.string().min(1) }).strict(),
 
     publishing: z
       .object({
-        lagMinutes: positive,
         maxSignalChars: z.number().int().positive(),
-        predictionHeader: z.string().min(1),
+        perpHeader: z.string().min(1),
+        requireSignalCorrespondence: z.boolean(),
       })
       .strict(),
   })
@@ -153,33 +190,40 @@ export function loadConfig(path = 'config/default.yaml'): Config {
 }
 
 /**
- * Route B must not place a single order until maxLeverage has been written to
- * config as an explicit number by the Part IX stop verification.
+ * No order may be placed until maxLeverage has been written to config as an
+ * explicit number by the Part IX stop verification.
  *
  * This is the only accessor for that value. It exists so the failure is a throw
  * at the call site rather than a silent fallback that puts an unverified stop
  * mechanism in front of a leveraged book.
  */
 export function requireMaxLeverage(config: Config): number {
-  const { armed, maxLeverage } = config.routeB;
-
-  if (!armed) {
-    throw new ConfigError(
-      'Route B is not armed. It arms only when Polymarket execution is proven live ' +
-        'end to end AND the Part IX venue-held stop verification has passed.',
-    );
-  }
+  const { maxLeverage } = config.execution;
 
   if (maxLeverage === undefined) {
     throw new ConfigError(
-      'routeB.maxLeverage is not set. Run the Part IX venue-held stop verification and ' +
-        'write the result explicitly (3 = venue-held stops confirmed, 1.5 = client-held ' +
-        'stops only). There is no default: an unverified stop mechanism must never reach ' +
-        'a leveraged book.',
+      'execution.maxLeverage is not set. Run the Part IX venue-held stop verification and write ' +
+        'the result explicitly (5 = venue-held stops confirmed, 2 = client-held stops only, ' +
+        'do not trade if there is no stop capability). There is no default: an unverified stop ' +
+        'mechanism must never reach a leveraged book.',
     );
   }
 
   return maxLeverage;
+}
+
+/**
+ * Isolated margin is a requirement, not a preference. Cross margin means one bad
+ * position can consume the equity backing every other, which turns a single
+ * stop-out into a competition-ending event.
+ */
+export function assertIsolatedMargin(config: Config): void {
+  if (config.execution.marginMode !== 'isolated') {
+    throw new ConfigError(
+      `execution.marginMode is "${config.execution.marginMode}" — isolated margin is mandatory. ` +
+        'Cross margin lets one position consume the equity backing every other.',
+    );
+  }
 }
 
 export function riskFractionForStage(config: Config, stage: Stage): number {

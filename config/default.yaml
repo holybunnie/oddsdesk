@@ -1,109 +1,140 @@
-# OddsDesk — policy configuration.
+# AlphaGate — policy configuration.
+#
+# Accounting basis: Agent Trade Kit, USDT perpetuals. Chosen and irreversible.
 #
 # RULE: this file holds POLICY (our choices). It must never hold VENUE FACTS
-# (fees, tick sizes, min order sizes, leverage limits, gas costs). Those are
-# discovered at runtime and written to config/runtime-profile.<venue>.yaml.
-# If you are typing a number that describes a venue, it does not belong here.
+# (fee tiers, tick size, lot size, minimum notional, per-instrument max
+# leverage, funding schedule). Those are discovered at runtime and written to
+# config/runtime-profile.tradekit.yaml. If you are typing a number that
+# describes the venue, it does not belong here.
 #
 # Every value below is loaded at runtime. Changing a threshold is a YAML edit,
 # never a rebuild.
 
 capital:
   # Principal Base locks at registration and is the PnL% denominator for the
-  # whole competition. It must never change. Depositing permanently damages
-  # half the score, so there is no code path that can request one.
+  # whole competition. It never changes. Depositing permanently damages half the
+  # score, so there is no code path that can request one.
   principalBaseUsdt: 320
-  # Eligibility floor from the rules. Working equity must never cross this.
+  # Eligibility floor from the rules. The 20 above it is the compliance buffer.
   eligibilityFloorUsdt: 300
-
-  buckets:
-    gasReserveUsdt: 20
-    polymarketUsdt: 150
-    tradeKitUsdt: 150
-
-  # Day one is the point of minimum information. Deploy half of each bucket in
-  # the first four days, then let live results allocate the rest.
-  initialDeploymentFraction: 0.5
-  initialDeploymentDays: 4
-
-  gasAlertFraction: 0.5 # alert when gas reserve falls below this share
+  # No cash reserve: Principal Base is fixed regardless of deployment, so idle
+  # balance is pure drag on the percentage axis. Margin efficiency comes from
+  # leverage, not from holding cash back.
 
 risk:
-  # Fixed fractional risk per attempt, by stage. H3: the agent must be
+  # Fixed fractional risk per attempt, by stage. Law 9: the agent must be
   # structurally incapable of varying risk per trade. One function, no override.
   riskFractionByStage:
     1: 0.02
     2: 0.03
     3: 0.01
 
+  # Portfolio heat. Crypto perps correlate around 0.8 — three longs is one trade
+  # wearing three hats. This is the control that would have saved the model that
+  # sat in six losing shorts.
+  maxPortfolioHeat: 0.06
+  maxConcurrentPositions: 3
+  maxPositionsPerCorrelationGroup: 2
+
   # Drawdown governor, measured from PEAK equity, stage-aware.
-  # These are config defaults, not laws of nature — but they must be numbers.
   drawdownGovernor:
     1: { halveSizing: 0.18, flatAndHalt12h: 0.28, stopForCompetition: 0.38 }
     2: { halveSizing: 0.15, flatAndHalt12h: 0.25, stopForCompetition: 0.35 }
     3: { halveSizing: 0.08, flatAndHalt12h: 0.12, stopForCompetition: 0.18 }
 
   haltDurationHours: 12
-
-  # Stage triggers. Stage 3 is triggered by rank data, never by feel.
   stage2EquityMultiple: 2.0
 
-  # H2: no trade is entered without a defined stop and target at this ratio.
-  # If the setup cannot offer it, it is not a trade.
+  # Minimum target:stop ratio. No signal is issued without all four of entry,
+  # stop, target and size, and the target must clear this.
   minTargetStopRatio: 3.0
-  trailAfterR: 2.0
 
-  # Reference staleness. A dead feed returning its last value drains the
-  # account for a full day before anyone notices.
+  # A dead feed returning its last value drains the account for a full day
+  # before anyone notices.
   maxFeedStalenessSeconds: 30
   maxLeaderboardStalenessMinutes: 30
-
   reconcileIntervalSeconds: 300
 
-engines:
-  # Any engine negative after 4+ days and 10+ trades gets disabled.
-  # No exceptions, no "it'll turn around."
-  disableAfterDays: 4
-  disableAfterTrades: 10
+execution:
+  # Isolated always. Cross margin means one bad position can consume the equity
+  # backing every other; isolated caps damage at that position's margin.
+  marginMode: isolated
 
-routeB:
-  # maxLeverage is DELIBERATELY ABSENT. It is written by the Part IX venue-held
-  # stop verification and must be an explicit number before the first Route B
-  # order. A missing value throws — it must never fall back to a default.
+  # maxLeverage is DELIBERATELY ABSENT until the Part IX stop verification
+  # writes it. A missing value throws — it must never fall back to a default.
   #
-  #   venue-held resting stops confirmed -> 3
-  #   client-held stops only             -> 1.5, pyramiding disabled, watchdog required
-  #   no stop capability                 -> Route B does not arm
-  armed: false
+  #   venue-held resting stops confirmed -> 5
+  #   client-held stops only             -> 2, pyramiding disabled, watchdog required
+  #   no stop capability                 -> do not trade, escalate
+  #
+  # It is a CAP that rejects an oversized trade, never a target. With 2% risk
+  # and ATR stops, realised leverage should land between 0.5x and 2x; the cap
+  # exists to catch a pathological stop-distance calculation.
 
-  # H1 conviction gate. Qwen averaged ~83 confidence over 22-36 trades in 17
-  # days. The models that died overtraded.
-  minConfidence: 75
+  # Hard cap on cumulative fees as a share of Principal Base. Halt new entries
+  # on breach. DeepSeek paid a third of Qwen's fees and posted a better Sharpe.
+  feeBudgetFraction: 0.06
+
+signals:
+  # Conviction gate. Qwen averaged ~83 across 22-36 trades in 17 days; the
+  # models that died overtraded.
+  minConviction: 75
   targetTradesPerDay: 2
 
-  # Hard cap on total Route B fees as a share of Route B capital.
-  # Qwen paid 15.6% and still won; that is not a margin available at 320.
-  feeBudgetFraction: 0.08
+  # Regime gate: if fewer than this many instruments pass, the regime is
+  # unfavourable and the agent stands down. Standing down is a valid output.
+  minInstrumentsPassingRegime: 3
 
-  # H4 hold band. Below this you are scalping into fees; above it you are
-  # married to a thesis.
+exits:
+  # Stops are ATR-scaled, never a fixed percentage. ATR adapts to each
+  # instrument's volatility, which is what makes a 3% stop on BTC and a 9% stop
+  # on a high-beta alt equivalent risk.
+  atrPeriod: 14
+  initialStopAtrMultiple: 2.0
+
+  # Only 25% off at +2R: at a 30% win rate the entire expectancy lives in the
+  # fat right tail, and scaling out heavily amputates the trade that wins.
+  scaleOutAtR: 2.0
+  scaleOutFraction: 0.25
+  breakevenAtR: 2.0
+
+  chandelierAtrMultiple: 3.0
+  tightenTrailAtR: 4.0
+  tightenedChandelierAtrMultiple: 2.5
+
+  # Dead trades consume margin, portfolio heat and attention.
+  timeStopHours: 12
+  timeStopRequiresR: 1.0
   minHoldHours: 4
   maxHoldHours: 36
 
-  watchdog:
-    heartbeatIntervalSeconds: 10
-    staleFlattenSeconds: 60
+  # No re-entry on an instrument after a stop-out.
+  reentryCooldownHours: 4
+
+pyramiding:
+  # Stage 2 only, past +2R, stop at breakeven or better.
+  enabled: true
+  maxAdds: 2
+  # Each add smaller than the last. Decreasing sizes plus the stack-wide
+  # trailing stop are what separate this from over-leveraging in disguise.
+  addSizeMultiples: [1.0, 0.6, 0.4]
+
+attribution:
+  # If the realised payoff ratio drops below this over enough closed trades,
+  # the exit logic is broken — investigate before trading further.
+  minRealisedPayoffRatio: 2.5
+  payoffRatioMinTrades: 10
 
 ledger:
   path: var/ledger.sqlite
 
 killSwitch:
-  # Append-only file, checked every tick, trippable by any process.
   path: var/kill-switch
 
 publishing:
-  # Law 6: the ASP must not publish a live signal the trading agent has not yet
-  # acted on. Enforced as a hard gate in the publishing layer, not a convention.
-  lagMinutes: 30
   maxSignalChars: 200
-  predictionHeader: "[Prediction Market Signal]"
+  perpHeader: "[Perpetual Signal]"
+  # Law 6: every trade originates from a published signal. The executor may act
+  # only on signals that were actually delivered.
+  requireSignalCorrespondence: true
