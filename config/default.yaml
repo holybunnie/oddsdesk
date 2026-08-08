@@ -76,6 +76,47 @@ execution:
   # on breach. DeepSeek paid a third of Qwen's fees and posted a better Sharpe.
   feeBudgetFraction: 0.06
 
+universe:
+  # E1. The venue lists 423 live USDT perps including tokenised equities and
+  # commodities, so this filter does real work rather than accepting the list.
+  # Breadth is the strategy — at any moment something is trending violently —
+  # so these thresholds should admit tens of instruments, not a handful.
+  # Plain digits: YAML has no numeric separators, and 20_000_000 parses as a
+  # string that the schema then rejects.
+  minQuoteVolume24hUsdt: 20000000
+  maxSpreadBps: 5
+  # Tokenised equities and commodities trade on the venue as perps but gap
+  # across traditional market hours and weekends, which breaks the ATR and
+  # breakout logic. Excluded by explicit symbol list, refreshed when the venue
+  # adds more — never by a name-pattern guess.
+  excludeSymbols:
+    - AAPL
+    - ADBE
+    - AMD
+    - AMZN
+    - AVGO
+    - COIN
+    - CRCL
+    - GOOGL
+    - HOOD
+    - IBM
+    - INTC
+    - META
+    - MSFT
+    - MSTR
+    - NFLX
+    - NVDA
+    - ORCL
+    - PLTR
+    - QQQ
+    - SPY
+    - TSLA
+    - TSM
+    - XAG
+    - XAU
+    - XPD
+    - XPT
+
 signals:
   # Conviction gate. Qwen averaged ~83 across 22-36 trades in 17 days; the
   # models that died overtraded.
@@ -85,6 +126,37 @@ signals:
   # Regime gate: if fewer than this many instruments pass, the regime is
   # unfavourable and the agent stands down. Standing down is a valid output.
   minInstrumentsPassingRegime: 3
+
+regime:
+  # E2. Capital is destroyed by failed attempts in chop, not by the one big
+  # loser. This filter is the difference between arriving at the one great
+  # trend with most of the account or a fraction of it.
+  adxPeriod: 14
+  minAdx: 22
+  # Realized volatility band, per 1h bar, as a fraction. Too low means no
+  # follow-through; too high means stops get wicked out.
+  volLookback: 24
+  minRealizedVol: 0.002
+  maxRealizedVol: 0.030
+  # Volume must be expanding, not merely present. A breakout on contracting
+  # volume is the classic false break.
+  volumeWindow: 12
+  minVolumeTrend: 1.0
+  # Funding working against the intended direction is both a carrying cost and
+  # a crowding signal. Expressed per funding interval, as a fraction.
+  maxAdverseFundingRate: 0.0005
+
+ranking:
+  # E3. Momentum normalised by ATR so a 3% BTC move and a 12% alt move are
+  # comparable. Multiple lookbacks so a single bar cannot dominate.
+  lookbacksHours: [4, 12, 24]
+  atrPeriod: 14
+  # Only the extremes are traded: strongest for longs, weakest for shorts.
+  decileFraction: 0.1
+
+entry:
+  # E4. Breakout of an N-period high (long) or low (short) on the 1h chart.
+  breakoutLookback: 24
 
 exits:
   # Stops are ATR-scaled, never a fixed percentage. ATR adapts to each

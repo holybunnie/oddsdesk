@@ -79,11 +79,47 @@ export const configSchema = z
       })
       .strict(),
 
+    universe: z
+      .object({
+        minQuoteVolume24hUsdt: positive,
+        maxSpreadBps: positive,
+        excludeSymbols: z.array(z.string().min(1)),
+      })
+      .strict(),
+
     signals: z
       .object({
         minConviction: z.number().min(0).max(100),
         targetTradesPerDay: positive,
         minInstrumentsPassingRegime: z.number().int().positive(),
+      })
+      .strict(),
+
+    regime: z
+      .object({
+        adxPeriod: z.number().int().positive(),
+        minAdx: positive,
+        volLookback: z.number().int().positive(),
+        minRealizedVol: positive,
+        maxRealizedVol: positive,
+        volumeWindow: z.number().int().positive(),
+        minVolumeTrend: positive,
+        maxAdverseFundingRate: positive,
+      })
+      .strict()
+      .refine((r) => r.minRealizedVol < r.maxRealizedVol, 'the volatility band must be non-empty'),
+
+    ranking: z
+      .object({
+        lookbacksHours: z.array(z.number().int().positive()).min(1),
+        atrPeriod: z.number().int().positive(),
+        decileFraction: fraction,
+      })
+      .strict(),
+
+    entry: z
+      .object({
+        breakoutLookback: z.number().int().positive(),
       })
       .strict(),
 
