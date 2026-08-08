@@ -1,0 +1,22 @@
+node_modules/
+dist/
+*.log
+
+# Secrets — never commit. Law: no secrets in source, from commit one.
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+
+# Runtime state — machine-local, never shared between boxes
+data/
+var/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# Runtime-discovered venue profiles (Law 1: measured, not committed)
+config/runtime-profile.*.yaml

@@ -1,0 +1,109 @@
+# OddsDesk — policy configuration.
+#
+# RULE: this file holds POLICY (our choices). It must never hold VENUE FACTS
+# (fees, tick sizes, min order sizes, leverage limits, gas costs). Those are
+# discovered at runtime and written to config/runtime-profile.<venue>.yaml.
+# If you are typing a number that describes a venue, it does not belong here.
+#
+# Every value below is loaded at runtime. Changing a threshold is a YAML edit,
+# never a rebuild.
+
+capital:
+  # Principal Base locks at registration and is the PnL% denominator for the
+  # whole competition. It must never change. Depositing permanently damages
+  # half the score, so there is no code path that can request one.
+  principalBaseUsdt: 320
+  # Eligibility floor from the rules. Working equity must never cross this.
+  eligibilityFloorUsdt: 300
+
+  buckets:
+    gasReserveUsdt: 20
+    polymarketUsdt: 150
+    tradeKitUsdt: 150
+
+  # Day one is the point of minimum information. Deploy half of each bucket in
+  # the first four days, then let live results allocate the rest.
+  initialDeploymentFraction: 0.5
+  initialDeploymentDays: 4
+
+  gasAlertFraction: 0.5 # alert when gas reserve falls below this share
+
+risk:
+  # Fixed fractional risk per attempt, by stage. H3: the agent must be
+  # structurally incapable of varying risk per trade. One function, no override.
+  riskFractionByStage:
+    1: 0.02
+    2: 0.03
+    3: 0.01
+
+  # Drawdown governor, measured from PEAK equity, stage-aware.
+  # These are config defaults, not laws of nature — but they must be numbers.
+  drawdownGovernor:
+    1: { halveSizing: 0.18, flatAndHalt12h: 0.28, stopForCompetition: 0.38 }
+    2: { halveSizing: 0.15, flatAndHalt12h: 0.25, stopForCompetition: 0.35 }
+    3: { halveSizing: 0.08, flatAndHalt12h: 0.12, stopForCompetition: 0.18 }
+
+  haltDurationHours: 12
+
+  # Stage triggers. Stage 3 is triggered by rank data, never by feel.
+  stage2EquityMultiple: 2.0
+
+  # H2: no trade is entered without a defined stop and target at this ratio.
+  # If the setup cannot offer it, it is not a trade.
+  minTargetStopRatio: 3.0
+  trailAfterR: 2.0
+
+  # Reference staleness. A dead feed returning its last value drains the
+  # account for a full day before anyone notices.
+  maxFeedStalenessSeconds: 30
+  maxLeaderboardStalenessMinutes: 30
+
+  reconcileIntervalSeconds: 300
+
+engines:
+  # Any engine negative after 4+ days and 10+ trades gets disabled.
+  # No exceptions, no "it'll turn around."
+  disableAfterDays: 4
+  disableAfterTrades: 10
+
+routeB:
+  # maxLeverage is DELIBERATELY ABSENT. It is written by the Part IX venue-held
+  # stop verification and must be an explicit number before the first Route B
+  # order. A missing value throws — it must never fall back to a default.
+  #
+  #   venue-held resting stops confirmed -> 3
+  #   client-held stops only             -> 1.5, pyramiding disabled, watchdog required
+  #   no stop capability                 -> Route B does not arm
+  armed: false
+
+  # H1 conviction gate. Qwen averaged ~83 confidence over 22-36 trades in 17
+  # days. The models that died overtraded.
+  minConfidence: 75
+  targetTradesPerDay: 2
+
+  # Hard cap on total Route B fees as a share of Route B capital.
+  # Qwen paid 15.6% and still won; that is not a margin available at 320.
+  feeBudgetFraction: 0.08
+
+  # H4 hold band. Below this you are scalping into fees; above it you are
+  # married to a thesis.
+  minHoldHours: 4
+  maxHoldHours: 36
+
+  watchdog:
+    heartbeatIntervalSeconds: 10
+    staleFlattenSeconds: 60
+
+ledger:
+  path: var/ledger.sqlite
+
+killSwitch:
+  # Append-only file, checked every tick, trippable by any process.
+  path: var/kill-switch
+
+publishing:
+  # Law 6: the ASP must not publish a live signal the trading agent has not yet
+  # acted on. Enforced as a hard gate in the publishing layer, not a convention.
+  lagMinutes: 30
+  maxSignalChars: 200
+  predictionHeader: "[Prediction Market Signal]"
