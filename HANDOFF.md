@@ -103,7 +103,7 @@ Two things the annex corrects that were wrong in earlier sessions:
 
 Full detail in the annex §9. Three of these block registration outright.
 
-**Blocks registration:**
+**Blocks registration (two, not three — see the correction below):**
 
 1. **The name is too long for both fields.** `AlphaGate — Perpetual Momentum
    Signals` is **38 chars**; agent name caps at EN 3–25, service name at 5–30.
@@ -112,8 +112,16 @@ Full detail in the annex §9. Three of these block registration outright.
    so the mandatory `Perpetual` keyword still lands.
 2. **An avatar is mandatory and the spec never mentions one.** An uploaded image
    file ≤1 MB. Links rejected, no default for the ASP role. We have none.
-3. **One ASP per wallet address.** If the wallet already holds one, `create` is
-   refused and the flow forces an update instead.
+**Not a blocker — corrected.** Earlier notes claimed "one ASP per wallet".
+That is the rule for the *user* and *evaluator* roles, not ASP. The pre-check's
+`canCreate:true` branch explicitly handles "ASP role with existing ASPs (K >= 1)"
+and offers *1. New ASP / 2. Update #N*, and it returns a dedicated `aspCount`
+field. A second ASP is a supported choice, and even in the restricted case the
+consequence is a redirect to update, never a refusal.
+
+The real one-per-wallet-style constraint is a different thing entirely and is
+already recorded: competition rule 3.3 requires exactly **one subscription
+service**, earliest-created wins, never delete it.
 
 **Missing infrastructure:**
 

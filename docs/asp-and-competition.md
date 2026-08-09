@@ -218,7 +218,10 @@ Other registration-flow constraints (from the `okx-ai` skill's
   word or symbol, ≤6 decimals.
 - Monthly subscription → `fee:""`, `subscription:[{"interval":"month","fee":"<n>"}]`.
   Add `freeTrial:"72"` (fixed 3 days) only if offering a trial.
-- **One ASP per wallet address.** If one exists, the flow forces an update.
+- **ASPs are not limited to one per wallet.** The one-per-role rule applies to
+  the user and evaluator roles; the ASP branch offers *New ASP / Update #N* when
+  one already exists, and pre-check returns an `aspCount`. (Competition rule 3.3
+  separately requires exactly one *subscription service* — a different thing.)
 - A confirmation card + explicit confirm token is mandatory before any on-chain
   write. On-chain actions cost nothing — OKX covers gas.
 
@@ -322,9 +325,16 @@ on almost everything; these are the exceptions.
    for the ASP role (unlike user/evaluator). Nothing in Part IV or Part XIII
    accounts for producing one.
 
-3. **One ASP per wallet address.** If the wallet already holds an ASP identity,
-   `create` is refused and the flow forces an update of the existing one. The
-   spec assumes a clean create.
+**Not a blocker — corrected.** Earlier notes claimed "one ASP per wallet".
+That is the rule for the *user* and *evaluator* roles, not ASP. The pre-check's
+`canCreate:true` branch explicitly handles "ASP role with existing ASPs (K >= 1)"
+and offers *1. New ASP / 2. Update #N*, and it returns a dedicated `aspCount`
+field. A second ASP is a supported choice, and even in the restricted case the
+consequence is a redirect to update, never a refusal.
+
+The real one-per-wallet-style constraint is a different thing entirely and is
+already recorded: competition rule 3.3 requires exactly **one subscription
+service**, earliest-created wins, never delete it.
 
 ### Missing infrastructure
 
