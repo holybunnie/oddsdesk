@@ -1,5 +1,5 @@
 /**
- * Live scan — runs E1 through E3 against the real venue and prints what the
+ * Live scan — runs E1 through E4 against the real venue and prints what the
  * signal engine currently sees.
  *
  * This is the observability tool for the daily procedure and the acceptance
@@ -18,11 +18,24 @@ import {
   selectUniverse,
   takeExtremes,
   type Direction,
+  type RankedInstrument,
   type RegimeVerdict,
 } from '../signal/scanner.js';
+import { evaluateEntry } from '../signal/entry.js';
 
 /** Enough history for ADX(14), which needs roughly 2x its period plus slack. */
 const CANDLE_LIMIT = 120;
+
+/** 4h history for the multi-timeframe conviction component. */
+const HTF_CANDLE_LIMIT = 60;
+
+/** A candidate that reached the regime gate, kept with the side it was ranked for. */
+interface Assessed {
+  readonly ranked: RankedInstrument;
+  readonly direction: Direction;
+  readonly rankIndex: number;
+  readonly verdict: RegimeVerdict;
+}
 
 async function main(): Promise<void> {
   const config = loadConfig('config/default.yaml');
@@ -71,6 +84,8 @@ async function main(): Promise<void> {
   const ranked = rankByMomentum(config, candlesByInstrument);
   const extremes = takeExtremes(config, ranked);
 
+  const rankIndexOf = new Map(ranked.map((r, i) => [r.instId, i]));
+  const assessed: Assessed[] = [];
   const verdicts: RegimeVerdict[] = [];
   const check = (instId: string, direction: Direction): RegimeVerdict => {
     const candles = candlesByInstrument.get(instId);
@@ -84,19 +99,22 @@ async function main(): Promise<void> {
   console.log(`\nE3 ranking: ${ranked.length} instruments by ATR-normalised momentum`);
   console.log(`   taking the top and bottom ${(config.ranking.decileFraction * 100).toFixed(0)}%\n`);
 
-  console.log('LONG candidates (strongest momentum):');
-  for (const candidate of extremes.longs) {
-    const verdict = check(candidate.instId, 'long');
+  const assess = (candidate: RankedInstrument, direction: Direction): void => {
+    const verdict = check(candidate.instId, direction);
+    const rankIndex = rankIndexOf.get(candidate.instId);
+    if (rankIndex === undefined) {
+      throw new Error(`${candidate.instId} is an extreme but carries no rank`);
+    }
     verdicts.push(verdict);
+    assessed.push({ ranked: candidate, direction, rankIndex, verdict });
     report(candidate.instId, candidate.momentumScore, verdict);
-  }
+  };
+
+  console.log('LONG candidates (strongest momentum):');
+  for (const candidate of extremes.longs) assess(candidate, 'long');
 
   console.log('\nSHORT candidates (weakest momentum):');
-  for (const candidate of extremes.shorts) {
-    const verdict = check(candidate.instId, 'short');
-    verdicts.push(verdict);
-    report(candidate.instId, candidate.momentumScore, verdict);
-  }
+  for (const candidate of extremes.shorts) assess(candidate, 'short');
 
   const passing = verdicts.filter((v) => v.passed).length;
   const favourable = regimeIsFavourable(config, verdicts);
@@ -110,6 +128,89 @@ async function main(): Promise<void> {
       ? 'REGIME FAVOURABLE — the engine would look for entries among the passing candidates.'
       : 'REGIME UNFAVOURABLE — the engine stands down. Standing down is a valid output.',
   );
+
+  if (!favourable) return;
+
+  // E4 runs only on candidates that cleared E2. Evaluating the failures too
+  // would print entries the engine would never take, which is exactly the
+  // partial-picture-that-reads-as-complete this script must not produce.
+  const eligible = assessed.filter((a) => a.verdict.passed);
+  console.log(`\nE4 entry gate: ${eligible.length} candidates, conviction threshold ${config.signals.minConviction}\n`);
+
+  const nowMs = Date.now();
+  let accepted = 0;
+
+  for (const item of eligible) {
+    const candles1h = candlesByInstrument.get(item.ranked.instId);
+    if (candles1h === undefined) throw new Error(`missing 1h candles for ${item.ranked.instId}`);
+
+    const candles4h = confirmedOnly(
+      await market.candles(item.ranked.instId, '4H', HTF_CANDLE_LIMIT),
+    );
+
+    const verdict = evaluateEntry(config, {
+      ranked: item.ranked,
+      direction: item.direction,
+      candles1h,
+      candles4h,
+      volumeTrendValue: item.verdict.volumeTrend,
+      universeSize: ranked.length,
+      rankIndex: item.rankIndex,
+      nowMs,
+      // No cooldown state here: this script is stateless and holds no position
+      // history. The live engine supplies it; a scan intentionally over-reports
+      // rather than silently hiding a candidate it cannot reason about.
+    });
+
+    const symbol = item.ranked.instId.replace('-USDT-SWAP', '').padEnd(10);
+
+    if (!verdict.accepted) {
+      const score = verdict.rejection.conviction?.total;
+      console.log(
+        `  --    ${symbol} ${item.direction.padEnd(5)} ` +
+          `conviction ${score === undefined ? 'n/a' : score.toFixed(1)}`,
+      );
+      for (const reason of verdict.rejection.reasons) console.log(`         - ${reason}`);
+      continue;
+    }
+
+    accepted += 1;
+    const c = verdict.candidate;
+    console.log(
+      `  ENTRY ${symbol} ${c.direction.padEnd(5)} conviction ${c.conviction.total.toFixed(1)}`,
+    );
+    console.log(
+      `         band ${fmt(c.entryBandLow)} - ${fmt(c.entryBandHigh)}  ` +
+        `stop ${fmt(c.stopPrice)}  target ${fmt(c.targetPrice)}  ` +
+        `(broke ${fmt(c.breakoutLevel)}, atr ${fmt(c.atr)})`,
+    );
+    console.log(
+      `         components: mom ${pct(c.conviction.momentum)} adx ${pct(c.conviction.trendStrength)} ` +
+        `vol ${pct(c.conviction.volume)} 4h ${pct(c.conviction.multiTimeframe)}`,
+    );
+  }
+
+  // Frequency sanity check. The gate exists to make trading rare; a scan that
+  // fires broadly is a tuning signal, not a good day.
+  console.log(
+    `\n${accepted} entry signal(s) from ${eligible.length} eligible candidates. ` +
+      `Target is ~${config.signals.targetTradesPerDay}/day across all scans.`,
+  );
+  if (accepted > config.signals.targetTradesPerDay) {
+    console.log('NOTE: more signals in one scan than the daily target — the threshold may be too loose.');
+  }
+}
+
+/** Significant-figure formatting: perps range from 0.00001 to 100000. */
+function fmt(value: number): string {
+  if (!Number.isFinite(value)) return String(value);
+  const magnitude = Math.abs(value);
+  const decimals = magnitude >= 1000 ? 1 : magnitude >= 1 ? 4 : 8;
+  return value.toFixed(decimals);
+}
+
+function pct(fraction: number): string {
+  return `${(fraction * 100).toFixed(0)}%`;
 }
 
 function report(instId: string, momentum: number, verdict: RegimeVerdict): void {
