@@ -238,7 +238,7 @@ export async function runScan(options: ScanOptions): Promise<ScanDiagnostics> {
   }
 
   return {
-    result: { candidates, regimeFavourable, lastPrices, atrByInstrument, feeds },
+    result: { candidates, regimeFavourable, lastPrices, atrByInstrument, fundingRates: fundingByInstrument, feeds },
     liveUsdtPerps,
     universeSize: universe.length,
     ranked,

@@ -63,9 +63,27 @@ interface Snapshot {
   readonly peakEquityUsdt: number;
   /** Signal ids already acted on, with the time they were recorded. */
   readonly actedSignals: Readonly<Record<string, number>>;
+  /**
+   * Funding accrued so far, in USDT, and the instant it was last accrued to.
+   *
+   * Durable for the same reason peak equity is: the fee budget is a cap over the
+   * WHOLE competition, and one that reset on restart would be no cap at all on
+   * the day a restart happened. `lastFundingAccrualMs` is the half-open lower
+   * bound of the next accrual, so a crash between two funding timestamps cannot
+   * charge the same window twice or skip one.
+   */
+  readonly fundingPaidUsdt: number;
+  readonly lastFundingAccrualMs: number;
 }
 
-const EMPTY: Snapshot = { positions: [], cooldowns: {}, peakEquityUsdt: 0, actedSignals: {} };
+const EMPTY: Snapshot = {
+  positions: [],
+  cooldowns: {},
+  peakEquityUsdt: 0,
+  actedSignals: {},
+  fundingPaidUsdt: 0,
+  lastFundingAccrualMs: 0,
+};
 
 /**
  * How long an acted-on signal id is remembered.
@@ -91,6 +109,8 @@ export class EngineState {
   #cooldowns = new Map<string, number>();
   #actedSignals = new Map<string, number>();
   #peakEquityUsdt = 0;
+  #fundingPaidUsdt = 0;
+  #lastFundingAccrualMs = 0;
 
   constructor(path: string) {
     this.#path = resolve(path);
@@ -123,6 +143,8 @@ export class EngineState {
     this.#cooldowns = new Map(Object.entries(parsed.cooldowns));
     this.#actedSignals = new Map(Object.entries(parsed.actedSignals ?? {}));
     this.#peakEquityUsdt = parsed.peakEquityUsdt;
+    this.#fundingPaidUsdt = parsed.fundingPaidUsdt ?? 0;
+    this.#lastFundingAccrualMs = parsed.lastFundingAccrualMs ?? 0;
   }
 
   #persist(): void {
@@ -131,10 +153,43 @@ export class EngineState {
       cooldowns: Object.fromEntries(this.#cooldowns),
       peakEquityUsdt: this.#peakEquityUsdt,
       actedSignals: Object.fromEntries(this.#actedSignals),
+      fundingPaidUsdt: this.#fundingPaidUsdt,
+      lastFundingAccrualMs: this.#lastFundingAccrualMs,
     };
     const temporary = `${this.#path}.tmp`;
     writeFileSync(temporary, JSON.stringify(snapshot, null, 2), 'utf8');
     renameSync(temporary, this.#path);
+  }
+
+  get fundingPaidUsdt(): number {
+    return this.#fundingPaidUsdt;
+  }
+
+  get lastFundingAccrualMs(): number {
+    return this.#lastFundingAccrualMs;
+  }
+
+  /**
+   * Add funding accrued up to `toMs` and advance the accrual mark.
+   *
+   * The mark advances even when the amount is zero — a flat book still consumes
+   * funding windows, and leaving the mark behind would charge those windows
+   * against the first position opened afterwards.
+   */
+  accrueFunding(amountUsdt: number, toMs: number): number {
+    if (!Number.isFinite(amountUsdt)) {
+      throw new EngineStateError(`refusing to accrue a non-finite funding amount (${amountUsdt})`);
+    }
+    if (toMs < this.#lastFundingAccrualMs) {
+      // A clock that went backwards must not silently re-charge a window.
+      throw new EngineStateError(
+        `funding accrual mark would move backwards from ${this.#lastFundingAccrualMs} to ${toMs}`,
+      );
+    }
+    this.#fundingPaidUsdt += amountUsdt;
+    this.#lastFundingAccrualMs = toMs;
+    this.#persist();
+    return this.#fundingPaidUsdt;
   }
 
   positions(): readonly TrackedPosition[] {

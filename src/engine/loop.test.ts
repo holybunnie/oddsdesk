@@ -59,6 +59,10 @@ function scanOf(candidates: readonly EntryCandidate[], overrides: Partial<ScanRe
       [btc.symbol, 400],
       [sol.symbol, 4],
     ]),
+    fundingRates: new Map([
+      [btc.symbol, 0],
+      [sol.symbol, 0],
+    ]),
     feeds: [{ name: 'ohlc', lastUpdateMs: NOW }],
     ...overrides,
   };
@@ -715,3 +719,181 @@ describe('the competition clock gates entries', () => {
 function baseline(): Config {
   return loadConfig('config/default.yaml');
 }
+
+describe('E7 — the fee budget', () => {
+  /** A filled order carrying a venue-reported fee, in quote minor units. */
+  const chargeFee = (ledger: Ledger, usdt: number) => {
+    ledger.append({
+      action: 'order_filled',
+      engine: 'copy-executor',
+      venue: 'okx-tradekit',
+      instrument: btc.symbol,
+      signal: 'S-1',
+      price: '64000',
+      size: '24',
+      stop: '63000',
+      reason: 'venue status filled',
+      detail: { feePaid: String(Math.round(usdt * 1e8)) },
+    });
+  };
+
+  it('reports costs on every cycle, so the budget is never invisible', async () => {
+    const { engine, ledger } = build();
+    chargeFee(ledger, 1.5);
+    const report = await engine.runCycle(scanOf([]));
+
+    expect(report.costs.tradingFeesUsdt).toBeCloseTo(1.5, 6);
+    expect(report.costs.budgetUsdt).toBeCloseTo(19.2, 6);
+    expect(report.costs.breached).toBe(false);
+  });
+
+  it('halts NEW ENTRIES once the budget is spent', async () => {
+    // 6% of a 320 Principal Base is 19.20 USDT for the whole competition.
+    const { engine, ledger, publisher, copy } = build();
+    chargeFee(ledger, 20);
+    const report = await engine.runCycle(scanOf([candidate()]));
+
+    expect(report.costs.breached).toBe(true);
+    expect(report.standDownReason).toMatch(/fee budget spent/);
+    expect(publisher.published).toHaveLength(0);
+    expect(copy.executed).toHaveLength(0);
+  });
+
+  it('still MANAGES open positions with the budget spent', async () => {
+    // Fees are the price of taking positions, so the response to spending the
+    // budget is to stop taking them — not to abandon the ones already paid for.
+    const { engine, ledger, state, guard } = build();
+    chargeFee(ledger, 20);
+    state.open(
+      trackNewPosition({
+        instId: btc.symbol,
+        signalId: 'S-260812080000-BTC-L',
+        side: 'long',
+        entryPrice: 64_000,
+        initialStop: 63_000,
+        openedAtMs: NOW - 3_600_000,
+        venueSize: 24n,
+      }),
+    );
+
+    await engine.runCycle(scanOf([], { lastPrices: new Map([[btc.symbol, 62_000]]) }));
+    expect(guard.flattened).toHaveLength(1);
+  });
+
+  it('accrues funding against open positions and counts it toward the budget', async () => {
+    // The half that was invisible before. A tracker that counted only fees
+    // reported 2 bps maker and looked healthy while carry ate the budget.
+    const { engine, state } = build({ now: Date.UTC(2026, 7, 12, 7, 59) });
+    state.open(
+      trackNewPosition({
+        instId: btc.symbol,
+        signalId: 'S-1',
+        side: 'long',
+        entryPrice: 64_000,
+        initialStop: 63_000,
+        openedAtMs: Date.UTC(2026, 7, 12, 0, 0),
+        venueSize: 24n,
+      }),
+    );
+
+    // First cycle sets the accrual mark without charging: a cold start must not
+    // bill every funding window since the epoch.
+    await engine.runCycle(
+      scanOf([], {
+        lastPrices: new Map([[btc.symbol, 64_000]]),
+        fundingRates: new Map([[btc.symbol, 0.001]]),
+      }),
+    );
+    expect(state.fundingPaidUsdt).toBe(0);
+  });
+
+  it('charges a funding window crossed between two cycles', async () => {
+    const state = new EngineState(join(dir, `state-funding-${stateSeq++}.json`));
+    state.open(
+      trackNewPosition({
+        instId: btc.symbol,
+        signalId: 'S-1',
+        side: 'long',
+        entryPrice: 64_000,
+        initialStop: 63_000,
+        openedAtMs: Date.UTC(2026, 7, 12, 0, 0),
+        venueSize: 24n,
+      }),
+    );
+    // 0.24 contracts x 0.01 BTC x 64000 = 153.6 USDT notional, at 0.1% = 0.1536.
+    state.accrueFunding(0, Date.UTC(2026, 7, 12, 7, 59));
+
+    const ledger = new Ledger(join(dir, 'ledger-funding.db'));
+    const engine = new Engine({
+      config: { ...baseConfig, execution: { ...baseConfig.execution, maxLeverage: 5 } },
+      state,
+      ledger,
+      killSwitch: new KillSwitch(join(dir, 'kill-funding.jsonl')),
+      executor: new FakeGuard() as unknown as GuardedExecutor,
+      copyExecutor: new FakeCopyExecutor() as unknown as CopyExecutor,
+      publisher: new FakePublisher(),
+      instruments,
+      readEquity: async () => 400,
+      readRankCushion: async () => null,
+      now: () => Date.UTC(2026, 7, 12, 8, 1),
+    });
+
+    const report = await engine.runCycle(
+      scanOf([], {
+        lastPrices: new Map([[btc.symbol, 64_000]]),
+        fundingRates: new Map([[btc.symbol, 0.001]]),
+      }),
+    );
+
+    expect(state.fundingPaidUsdt).toBeCloseTo(0.1536, 6);
+    expect(report.costs.fundingUsdt).toBeCloseTo(0.1536, 6);
+  });
+
+  it('does not charge the same window twice across consecutive cycles', async () => {
+    // The accrual mark is half-open. Double-charging would make the budget bind
+    // early, which looks exactly like a strategy that trades too much.
+    const { engine, state } = build({ now: Date.UTC(2026, 7, 12, 8, 1) });
+    state.open(
+      trackNewPosition({
+        instId: btc.symbol,
+        signalId: 'S-1',
+        side: 'long',
+        entryPrice: 64_000,
+        initialStop: 63_000,
+        openedAtMs: Date.UTC(2026, 7, 12, 0, 0),
+        venueSize: 24n,
+      }),
+    );
+    const scan = scanOf([], {
+      lastPrices: new Map([[btc.symbol, 64_000]]),
+      fundingRates: new Map([[btc.symbol, 0.001]]),
+    });
+
+    await engine.runCycle(scan);
+    const afterFirst = state.fundingPaidUsdt;
+    await engine.runCycle(scan);
+
+    expect(state.fundingPaidUsdt).toBe(afterFirst);
+  });
+
+  it('records R on a terminal close, so Part VIII can measure the payoff', async () => {
+    const { engine, state, ledger } = build();
+    state.open(
+      trackNewPosition({
+        instId: btc.symbol,
+        signalId: 'S-260812080000-BTC-L',
+        side: 'long',
+        entryPrice: 64_000,
+        initialStop: 63_000,
+        openedAtMs: NOW - 3_600_000,
+        venueSize: 24n,
+      }),
+    );
+
+    await engine.runCycle(scanOf([], { lastPrices: new Map([[btc.symbol, 62_000]]) }));
+
+    const closes = ledger.recent(50).filter((row) => row.action === 'position_closed');
+    expect(closes[0]?.detail?.['terminal']).toBe(true);
+    expect(closes[0]?.detail?.['rMultiple']).toBeCloseTo(-2, 6);
+  });
+});

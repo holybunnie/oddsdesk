@@ -34,6 +34,14 @@ import {
   type Config,
   type Stage,
 } from '../config.js';
+import {
+  accrueFundingUsdt,
+  costBreakdown,
+  describeCosts,
+  tradingFeesUsdt,
+  type CostBreakdown,
+  type FundingExposure,
+} from '../fees.js';
 import type { KillSwitch } from '../kill-switch.js';
 import type { Ledger } from '../ledger.js';
 import {
@@ -88,6 +96,13 @@ export interface ScanResult {
   readonly lastPrices: ReadonlyMap<string, number>;
   /** Current ATR per instrument, for the Chandelier trail. */
   readonly atrByInstrument: ReadonlyMap<string, number>;
+  /**
+   * Current funding rate per instrument, for E7's accrual.
+   *
+   * The scan already fetches these for E2, so carrying them through costs one
+   * map and avoids a second round of requests for numbers we hold.
+   */
+  readonly fundingRates: ReadonlyMap<string, number>;
   /** Freshness of the feeds this scan depended on. Passed straight to the guard. */
   readonly feeds: readonly FeedFreshness[];
 }
@@ -117,6 +132,8 @@ export interface CycleReport {
   readonly governor: GovernorAction;
   /** Where the cycle found itself on the competition clock. */
   readonly phase: CompetitionPhase;
+  /** E7 — fees measured, funding modelled, and whether the budget is spent. */
+  readonly costs: CostBreakdown;
   readonly equityUsdt: number;
   readonly peakEquityUsdt: number;
   readonly exits: readonly ExitPlan[];
@@ -193,6 +210,11 @@ export class Engine {
       const stage = determineStage(config, equity, await this.#deps.readRankCushion());
       const governor = governorAction(config, equity, stage);
 
+      // 3b. E7 — costs. Funding is accrued BEFORE the budget is read, so a
+      //     window crossed during this cycle counts against this cycle's
+      //     decision rather than the next one's.
+      const costs = this.#accrueAndMeasureCosts(scan, nowMs);
+
       const base = {
         stage,
         governor,
@@ -200,6 +222,7 @@ export class Engine {
         peakEquityUsdt,
         exits,
         phase,
+        costs,
       } as const;
 
       const standDown = (reason: string): CycleReport => {
@@ -235,6 +258,13 @@ export class Engine {
                 `${config.competition.endgame.noNewEntriesHoursBeforeEnd}h`,
         );
       }
+      // E7's cap. It halts NEW ENTRIES only — never exits, and never the
+      // management of what is already open. Fees are the price of taking
+      // positions, so the response to spending the budget is to stop taking
+      // them, not to abandon the ones already paid for.
+      if (costs.breached) {
+        return standDown(`fee budget spent: ${describeCosts(costs)}`);
+      }
       if (governor === 'stopForCompetition') {
         return standDown('governor has stopped trading for the competition');
       }
@@ -257,6 +287,68 @@ export class Engine {
       // another failure.
       cycle.assertBalanced();
     }
+  }
+
+  /**
+   * Accrue this cycle's funding and read the fee budget.
+   *
+   * Funding is charged on the venue's wall-clock schedule, so what is accrued
+   * depends on which funding timestamps fell inside the interval since the last
+   * accrual — not on how long the cycle took. The mark advances even when
+   * nothing is owed, so a flat spell does not bank windows to charge against the
+   * next position opened.
+   *
+   * A position the scan cannot price is skipped rather than fatal. Unlike exit
+   * management, where an unpriceable position means trailing a stop off a stale
+   * number, an unaccrued funding window makes the budget slightly optimistic —
+   * and halting the engine over an accounting approximation would be a worse
+   * outcome than the approximation.
+   */
+  #accrueAndMeasureCosts(scan: ScanResult, nowMs: number): CostBreakdown {
+    const { config, state, ledger } = this.#deps;
+
+    const exposures: FundingExposure[] = [];
+    for (const position of state.positions()) {
+      const price = scan.lastPrices.get(position.instId);
+      const fundingRate = scan.fundingRates.get(position.instId);
+      if (price === undefined || fundingRate === undefined) continue;
+
+      const instrument = this.#instrument(position.instId);
+      const coins =
+        (Number(BigInt(position.venueSize)) / 10 ** instrument.sizeDecimals) *
+        (instrument.contractValue ?? 1);
+
+      exposures.push({
+        instId: position.instId,
+        side: position.side,
+        notionalUsdt: Math.abs(coins * price) * position.remainingFraction,
+        fundingRate,
+      });
+    }
+
+    // A cold start has no mark. Accruing from epoch zero would charge every
+    // funding window since 1970; starting the mark here loses at most the
+    // current window, which is the honest cost of not having been running.
+    const from = state.lastFundingAccrualMs === 0 ? nowMs : state.lastFundingAccrualMs;
+    const accrued = accrueFundingUsdt(exposures, from, nowMs, config.regime.fundingWindowHours);
+    const fundingPaidUsdt = state.accrueFunding(accrued, nowMs);
+
+    if (accrued !== 0) {
+      ledger.append({
+        action: 'alert',
+        engine: 'engine-loop',
+        venue: this.#deps.executor.venue,
+        instrument: null,
+        signal: null,
+        price: null,
+        size: null,
+        stop: null,
+        reason: `funding accrued ${accrued.toFixed(4)} USDT (modelled, not read from venue bills)`,
+        detail: { fundingPaidUsdt, exposures },
+      });
+    }
+
+    return costBreakdown(config, tradingFeesUsdt(ledger), fundingPaidUsdt);
   }
 
   #tripped(): boolean {
@@ -311,6 +403,21 @@ export class Engine {
           const instrument = this.#instrument(tracked.instId);
           await this.#deps.executor.flatten(instrument, `${advanced.signalId}: ${action.reason}`);
           state.close(tracked.instId, action.cooldownUntilMs);
+          ledger.append({
+            action: 'position_closed',
+            engine: 'engine-loop',
+            venue: this.#deps.executor.venue,
+            instrument: tracked.instId,
+            signal: advanced.signalId,
+            price: String(lastPrice),
+            size: advanced.venueSize,
+            stop: String(advanced.currentStop),
+            reason: `full: ${action.reason}`,
+            // R is what Part VIII measures. Recorded numerically here because
+            // parsing it back out of the reason string would make the daily
+            // attribution depend on prose.
+            detail: { rMultiple: plan.rMultiple, fraction: advanced.remainingFraction, terminal: true },
+          });
           await this.#publishExit(advanced, nowMs, lastPrice, action.reason, 'C', {
             kind: 'close',
             percent: advanced.remainingFraction * 100,
@@ -353,6 +460,7 @@ export class Engine {
             size: null,
             stop: null,
             reason: `partial: ${action.reason}`,
+            detail: { rMultiple: plan.rMultiple, fraction: action.fraction, terminal: false },
           });
           await this.#publishExit(advanced, nowMs, lastPrice, action.reason, 'S', {
             kind: 'close',

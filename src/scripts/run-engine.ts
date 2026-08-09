@@ -21,6 +21,8 @@
 import { readFileSync } from 'node:fs';
 import { parse as parseYaml } from 'yaml';
 import { competitionPhase, entriesPermitted, loadConfig } from '../config.js';
+import { dailyAttribution, formatAttribution } from '../attribution.js';
+import { describeCosts } from '../fees.js';
 import { Ledger } from '../ledger.js';
 import { KillSwitch } from '../kill-switch.js';
 import { OkxMarketData } from '../market/okx.js';
@@ -199,6 +201,7 @@ async function main(): Promise<void> {
     onCycle: (report) => {
       console.log(
         `[cycle] phase ${report.phase} stage ${report.stage} governor ${report.governor} ` +
+          `costs ${describeCosts(report.costs)} ` +
           `equity ${report.equityUsdt.toFixed(2)} peak ${report.peakEquityUsdt.toFixed(2)} ` +
           `exits ${report.exits.length} signals ${JSON.stringify(report.signals)}` +
           (report.standDownReason === null ? '' : ` — ${report.standDownReason}`),
@@ -215,6 +218,11 @@ async function main(): Promise<void> {
         `${scan.result.candidates.length} candidate(s)`,
     );
     console.log(JSON.stringify(report, replacer, 2));
+    // Part VIII step 5. Printed from the LEDGER, not from this cycle: the point
+    // of the attribution is what has happened across the competition, and a
+    // block computed from live state would go blank on the restart after the
+    // crash you most want to explain.
+    console.log(`\nattribution:\n${formatAttribution(dailyAttribution(config, ledger))}`);
     return;
   }
 

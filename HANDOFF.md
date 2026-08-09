@@ -1,7 +1,7 @@
 # AlphaGate — Handoff
 
 **Last updated:** 2026-08-09 (session 7 — exit publication, the competition clock,
-the directional cap, funding as a cost, and the Part X endgame)
+the directional cap, funding as a cost, the Part X endgame, E7 and Part VIII)
 **Competition:** OKX.AI Hackathon Season 1
 **Registration closes:** Aug 11 12:00 UTC+8 — **the only irreversible deadline**
 **Trading window:** Aug 11 12:00 → Aug 25 12:00 UTC+8
@@ -45,7 +45,7 @@ Verified against live OKX on 2026-08-09 (second run, after session 7's changes):
 > was load-bearing: it made the correlation problem look like a single-cycle
 > event when it is actually a serial one that accumulates over days.
 
-Built and tested (**356 tests**): E1 universe filter (liquidity **and
+Built and tested (**397 tests**): E1 universe filter (liquidity **and
 affordability**) · E2 regime gate (stands down in chop) · E3 volatility-adjusted
 momentum ranking · E4 breakout entry with a conviction gate at 75 and **funding
 charged into the target** · E5 exits (2×ATR stop, 25% off at +2R, breakeven,
@@ -53,16 +53,18 @@ charged into the target** · E5 exits (2×ATR stop, 25% off at +2R, breakeven,
 **Part X endgame**) · sizing with no override path · portfolio heat cap ·
 **directional cap** · drawdown governor · kill switch · hash-chained append-only
 ledger · Trade Kit adapter · copy executor · engine loop · driver ·
-**entry AND exit signal publication** · **competition start gate**.
+**entry AND exit signal publication** · **competition start gate** ·
+**E7 fee budget (fees measured, funding modelled)** · **Part VIII attribution**.
 
 **It cannot place a single order, by design.** `execution.maxLeverage` is unset
 and `computeSize()` throws rather than defaulting. It stays that way until the
 Part IX stop kill test is observed. **Nothing here has touched real money** —
 and per Law 7, a safety mechanism that has never fired in a test does not exist.
 
-Still missing on the trading side: E6 pyramiding and E7 fee budget are in config
-but read by no code; daily attribution (Part VIII) is unbuilt; the leaderboard
-parser cannot be written until the page exists on Aug 11.
+Still missing on the trading side: **E6 pyramiding** is in config but read by no
+code — deliberately left, because it is Stage 2 only and Stage 2 needs a doubled
+account. `exits.minHoldHours` is also dead config. The leaderboard parser cannot
+be written until the page exists on Aug 11.
 
 ## 0a. Session 7 — ten defects found by review, and what was done
 
@@ -121,10 +123,24 @@ it, which is the entire point. DeepSeek went +125% → +4.89% without this.
 a 6% budget spread over ~40 trades — 1.7 trades of budget consumed by one
 position, while the fee tracker reported 2 bps maker and looked healthy.
 
-*Fixed:* threshold lowered to 0.0002 as a backstop, and expected carry is now
-**charged into the target**, so an expensive-to-hold instrument needs a bigger
-move to clear 3:1 rather than clearing it on gross. Visible in the live scan:
-PNUT 0.025%, MOODENG 0.046%.
+*Fixed in two halves.* At entry, expected carry is **charged into the target**,
+so an expensive-to-hold instrument needs a bigger move to clear 3:1 rather than
+clearing it on gross — visible in the live scan as PNUT 0.025%, MOODENG 0.046%.
+The threshold also dropped to 0.0002 as a backstop.
+
+*And the second half, which needed E7 built first:* funding is now **accrued
+against the fee budget**. `execution.feeBudgetFraction` was config read by no
+code, so "add funding to the fee budget" was not an addition — there was no
+budget. `src/fees.ts` now tracks both and halts new entries at 6% of Principal
+Base (19.20 USDT).
+
+**The two costs are not the same kind of number, and the code says so
+everywhere they appear.** Trading fees are MEASURED, off `detail.feePaid` on
+`order_filled` receipts; an unreported fee counts as zero rather than as an
+estimate. Funding is MODELLED, accrued at the venue's real wall-clock funding
+timestamps — the adapter cannot read venue bills, so this is an approximation of
+a real cash flow, and a far better one than the zero assumed before. Replace it
+with bills when the adapter learns to read them.
 
 **8. minSz was never counted. ANSWERED — it is a non-issue.** Measured against
 live OKX: **0 of 423 live USDT perps have a minimum order above $60.** The
@@ -137,7 +153,26 @@ rejections by reason so this question never needs asking twice.
 
 **10. No expectancy evidence.** Not fixable, and not attempted. See §1b.
 
-Everything above is tested. The suite went from 292 to **356**.
+### Also built, from the pre-existing list rather than the review
+
+- **E7 fee discipline** (`src/fees.ts`) — see #7 above. Halts new entries on
+  breach, never exits: fees are the price of taking positions, so the response
+  to spending the budget is to stop taking them, not to abandon the ones already
+  paid for.
+- **Part VIII daily attribution** (`src/attribution.ts`) — hit rate, average R
+  won and lost, **realised payoff ratio**, per-instrument R, all computed from
+  the hash-chained ledger rather than from live state, so the report survives the
+  restart after the crash you most want explained.
+
+  It measures **terminal closes only**. Counting a +2R scale-out would fill the
+  sample with guaranteed winners taken at a fixed multiple and report the exit
+  system as healthy precisely *because* it takes profits early — the failure the
+  ratio exists to detect. And it returns **null, never Infinity**, when there are
+  no losses yet: an untested denominator is not a passing grade. "Not enough
+  evidence" is a distinct verdict from "healthy", because conflating them is how
+  a strategy gets changed on nine trades.
+
+Everything above is tested. The suite went from 292 to **397**.
 
 ---
 
@@ -763,7 +798,19 @@ registered and its delivery contract is observable, which makes registration the
 blocker for code as well as for eligibility.
 
 ~~Exit publication, competition clock, directional cap, funding cost, Part X
-endgame, E1 affordability.~~ **Done in session 7** — see §0a. 356 tests.
+endgame, E1 affordability, **E7 fee budget**, **Part VIII attribution**.~~
+**Done in session 7** — see §0a. 397 tests.
+
+Remaining unbuilt trading code, in the order I would take it:
+
+- **E6 pyramiding** — config read by no code. Stage 2 only, and Stage 2 needs a
+  doubled account, so this is a week away at the earliest. Lowest priority of
+  anything left.
+- **`exits.minHoldHours`** — dead config. Either wire it into E5 or delete it;
+  a threshold nobody reads is worse than no threshold, because it reads as a
+  control that exists.
+- **Funding from venue bills** rather than modelled. `src/fees.ts` is structured
+  for the swap: replace the accrual, keep the budget.
 
 Then 10 and 11.
 
@@ -824,6 +871,14 @@ Then 10 and 11.
 - **`maxPositionsPerSide` must stay strictly below `maxConcurrentPositions`.**
   The schema enforces it. Equal values permit a fully one-sided book, which is
   the concentration the cap exists to prevent.
+- **Funding in the fee budget is MODELLED, not measured.** `src/fees.ts` accrues
+  it from the observed rate at the venue's wall-clock funding timestamps, because
+  the adapter cannot read venue bills. Trading fees in the same budget ARE
+  measured. Do not let the two blur together in a report — every printout names
+  which is which, deliberately.
+- **Part VIII counts terminal closes only.** Including scale-outs would fill the
+  sample with guaranteed +2R winners and report the exit system as healthy
+  precisely because it takes profits early — the failure the ratio detects.
 - **`regime.fundingWindowHours` is the one assumed number in `config/default.yaml`.**
   Every other value there is policy or measured; this is a venue fact sitting in
   a policy file, unverified. It is 8 for every OKX USDT perp today. Move it to
