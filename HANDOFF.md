@@ -1,6 +1,6 @@
 # AlphaGate — Handoff
 
-**Last updated:** 2026-08-09 (session 5 — engine loop built; the code path is complete)
+**Last updated:** 2026-08-09 (session 6 — driver, scan pipeline and journal; the agent runs)
 **Competition:** OKX.AI Hackathon Season 1
 **Registration closes:** Aug 11 12:00 UTC+8 — **the only irreversible deadline**
 **Trading window:** Aug 11 12:00 → Aug 25 12:00 UTC+8
@@ -10,7 +10,7 @@
 
 ## 1. Where things stand in one paragraph
 
-The venue-agnostic core is built and tested (**276 tests, typecheck clean**).
+The venue-agnostic core is built and tested (**292 tests, typecheck clean**).
 The whole signal path — E1 through E5 — is now complete and tested, and
 `scan.ts` runs it end to end against the live OKX venue and prints real entry
 candidates with bands, stops, targets and conviction breakdowns. The publication
@@ -19,11 +19,15 @@ order path is verified to reach the venue's margin check. Nothing can place a
 live order yet, by design: `maxLeverage` is unset until the stop kill test is
 observed, and `computeSize()` refuses to produce a position while it is unset.
 The execution half is built too — the **Trade Kit adapter** over the `okx` CLI
-and the **copy executor** — and the **engine loop** now joins them, so the code
-path from market data to a placed order is complete end to end. What remains is
-hardening, the leaderboard parser (Aug 11 only), and the live verification that
-`maxLeverage` depends on. The two things blocking progress are both external:
-funding the sub-account, and registering the ASP.
+and the **copy executor** — the **engine loop** joins them, and the **driver**
+now runs the whole thing on a timer. `run-engine.ts` assembles every component
+and executes end to end against the live venue; in this dev environment it stops
+at the credential check, which is where it should stop. The one remaining
+placeholder in the running path is the **ASP publisher**, which throws rather
+than no-ops. What else remains is hardening, the leaderboard parser (Aug 11
+only), and the live verification `maxLeverage` depends on. The two things
+blocking progress are still external: funding the sub-account, and registering
+the ASP.
 
 **Time check:** registration closes Aug 11 12:00 UTC+8, so it is now **~2 days
 out** and the practical deadline for starting is roughly **Aug 10 midday**
@@ -329,6 +333,62 @@ not become safe, it has become an abandoned book. Only step 4 is gated.
 own bucket rather than being pooled into a shared "other" that would make two
 unrelated small caps count as a correlated pair.
 
+### `src/engine/scan.ts` — the scan pipeline (5 tests)
+E1-E4 as a value, so there is exactly **one** implementation of the scan
+ordering. `scan.ts` now renders it rather than re-deriving it; two copies would
+drift, and the drift would be invisible — the script reporting what the engine
+no longer does is worse than having no script.
+
+- **Open positions are priced even when they fall out of E1.** An instrument
+  whose volume dries up leaves the universe, but a position in it still has to
+  be managed, and the engine refuses to manage a position it cannot price.
+  `mustPrice` fetches them explicitly.
+- **Feed freshness is measured from when the bar CLOSED**, not when it opened. A
+  confirmed 1h bar is up to an hour old by construction; measuring from the open
+  makes every healthy feed look an hour stale and refuses every order at the
+  guard.
+- The **worst** feed is reported, not the average. One instrument stuck on an
+  old bar is a stale feed even when the rest are current.
+- Cooldowns are passed into E4. The script has none and over-reports by design.
+
+### `src/engine/driver.ts` — the driver (11 tests)
+Owns the timer, the process, and the decision to continue after a failure.
+
+- **Cycles never overlap.** `setInterval` would start a second cycle while the
+  first is reconciling, and two cycles reading one position book double-size the
+  same candidate. The next cycle is scheduled after the previous one finishes.
+- **A transient failure is tolerated.** The ASP must never go down; an engine
+  that exits on the first HTTP hiccup fails the eligibility requirement it was
+  built to satisfy.
+- **Three consecutive failures trip the kill switch.** One failure is the venue,
+  three in a row is us — and that difference is not visible in any single error,
+  only in the pattern. The counter resets after a good cycle, so three failures
+  spread over a fortnight do not halt the agent.
+- `stop()` finishes the cycle in flight rather than aborting. Interrupting
+  mid-cycle can leave a position opened but untracked, the one inconsistency the
+  state file cannot repair.
+
+### `src/scripts/run-engine.ts` — the entrypoint
+Assembly with no logic; every decision it could make is already made in a tested
+module. It adds only the refusals that belong at startup:
+
+- **Stop custody and position mode come from the runtime profile**, never
+  literals. A hardcoded `venue-held` would defeat the Part IX gate from outside
+  it, which is the one move the gate cannot defend against.
+- A custody claim with `killTestObserved: false` is **refused**. A value that
+  was not observed is worse than none: it puts an unverified stop mechanism in
+  front of a leveraged book while looking verified.
+- **`--live` is explicit**; the default is a single dry cycle. An entrypoint
+  that trades by default is one mistyped command from trading when someone meant
+  to look.
+- On halt it exits **non-zero** — the reference daemon's exit-zero-on-JWT-expiry
+  trap is not repeated.
+
+```bash
+NODE_OPTIONS=--dns-result-order=ipv4first npx tsx src/scripts/run-engine.ts         # dry
+NODE_OPTIONS=--dns-result-order=ipv4first npx tsx src/scripts/run-engine.ts --live  # run
+```
+
 ### `src/scripts/scan.ts`
 Live observability tool, now running **E1 → E4**. Run it any time:
 
@@ -401,32 +461,26 @@ universe, which is the right order of magnitude.
 ~~12. Wire the engine loop.~~ **Done** — `src/engine/loop.ts` + `state.ts`,
 28 tests.
 
+~~Driver and signal journal.~~ **Done** — `src/engine/driver.ts`,
+`src/engine/scan.ts`, `EngineState.signalJournal()`, `run-engine.ts`.
+
 **Start here next session:**
 
-10 and 11 are what remain in code. Before either, the loop needs its **driver**:
-`runCycle()` takes a `ScanResult` and returns a report, but nothing yet builds
-that `ScanResult` from `scan.ts`'s E1-E4 pass on a timer, and nothing implements
-`SignalPublisher` against the ASP. Both are small and both are the last things
-standing between the tested modules and a running agent.
+**13. The ASP publisher** is now the only placeholder in the running path.
+`UnbuiltPublisher` throws by design — a publisher that silently succeeded would
+let the engine trade signals nobody received, which reads as a working agent
+from every angle except the rules. It cannot be written until the ASP is
+registered and its delivery contract is observable, which makes registration the
+blocker for code as well as for eligibility.
+
+Then 10 and 11.
 
 10. **Server hardening** — systemd units with `MemoryMax`, ufw, NTP, alerts,
     pending reboot (`libc6` + kernel update outstanding).
 11. **Leaderboard parser** — Aug 11 only, against the real page.
 12. ~~**Wire the engine loop**~~ — done. What is still missing around it:
 
-    - A **driver** that runs E1-E4 on a timer and hands `runCycle()` a
-      `ScanResult` (candidates, regime verdict, last prices, ATRs, feed
-      freshness). `scan.ts` already computes all of it; it prints rather than
-      returns.
-    - A **`SignalPublisher`** against the ASP. `publish()` must resolve only
-      once the signal is genuinely delivered — resolving optimistically would
-      let the engine trade a signal whose record never arrived, which is the
-      precise inversion of Law 6.
-    - `stopCustody` read from the runtime profile, never a literal at the call
-      site.
-    - A **persistent `SignalJournal`** for the copy executor. `EngineState` is
-      the obvious home; the in-memory one loses its dedupe set on restart, and
-      the deterministic clOrdId is the second line of defence, not the first.
+    All done except the publisher, which is item 13.
 
 
 ## 7. Traps already identified — do not rediscover these the hard way
