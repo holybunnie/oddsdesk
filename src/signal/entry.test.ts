@@ -5,6 +5,7 @@ import { atr } from './indicators.js';
 import {
   EntryError,
   evaluateEntry,
+  expectedFundingCostFraction,
   hasBrokenOut,
   scoreConviction,
   type EntryInputs,
@@ -87,6 +88,7 @@ const inputs = (overrides: Partial<EntryInputs> = {}): EntryInputs => ({
   volumeTrendValue: 3.0,
   universeSize: 80,
   rankIndex: 0,
+  fundingRate: 0,
   nowMs: NOW,
   ...overrides,
 });
@@ -327,5 +329,73 @@ describe('evaluateEntry — rejection', () => {
     if (verdict.accepted) throw new Error('expected rejection');
     expect(verdict.rejection.instId).toBe('BTC-USDT-SWAP');
     expect(verdict.rejection.direction).toBe('long');
+  });
+});
+
+describe('funding as a cost, not just a filter', () => {
+  it('charges nothing when funding pays us', () => {
+    // Funding in our favour is real income, but pricing a trade on income that
+    // inverts the moment the crowd rotates turns a cost model into an
+    // optimistic one. Favourable funding is simply free.
+    expect(expectedFundingCostFraction(config, -0.0001, 'long')).toBe(0);
+    expect(expectedFundingCostFraction(config, 0.0001, 'short')).toBe(0);
+  });
+
+  it('charges every window that fits inside the maximum hold', () => {
+    // The hold band runs to 36h at 8h per window, so the honest worst case is
+    // 5 payments. Assuming an average would price the trade on a hold we have
+    // not committed to.
+    const windows = Math.ceil(config.exits.maxHoldHours / config.regime.fundingWindowHours);
+    expect(expectedFundingCostFraction(config, 0.0002, 'long')).toBeCloseTo(0.0002 * windows, 12);
+  });
+
+  it('pushes the target out rather than merely vetoing the trade', () => {
+    // This is the difference the fix makes. Before, funding was a filter and an
+    // "acceptable" rate was treated as free; now an expensive-to-hold
+    // instrument needs a bigger move to clear the same payoff ratio.
+    const free = evaluateEntry(config, inputs({ fundingRate: 0 }));
+    const costly = evaluateEntry(config, inputs({ fundingRate: 0.0002 }));
+
+    expect(free.accepted && costly.accepted).toBe(true);
+    if (!free.accepted || !costly.accepted) return;
+
+    expect(costly.candidate.targetPrice).toBeGreaterThan(free.candidate.targetPrice);
+    expect(costly.candidate.expectedFundingCostFraction).toBeGreaterThan(0);
+    // The stop is untouched: carry changes what the trade must earn, never what
+    // it is allowed to lose.
+    expect(costly.candidate.stopPrice).toBe(free.candidate.stopPrice);
+  });
+
+  it('charges a short for negative funding, mirroring the long', () => {
+    const shortInputs = { direction: 'short' as const, candles1h: shortBreakout1h(), rankIndex: 79 };
+    const free = evaluateEntry(config, inputs({ ...shortInputs, fundingRate: 0 }));
+    const costly = evaluateEntry(config, inputs({ ...shortInputs, fundingRate: -0.0002 }));
+
+    if (!free.accepted || !costly.accepted) {
+      expect.unreachable('both short setups should clear the gate');
+      return;
+    }
+    // A short's target sits BELOW entry, so carry pushes it further down.
+    expect(costly.candidate.targetPrice).toBeLessThan(free.candidate.targetPrice);
+  });
+});
+
+describe('TP1 — the level E5 actually acts on', () => {
+  it('sits at the scale-out threshold, not at the screening target', () => {
+    // The old signal published the 3:1 target and described it as the plan. E5
+    // has no target logic at all: it takes 25% off at +2R and trails the rest,
+    // so published intent and actual behaviour diverged on every winner.
+    const verdict = evaluateEntry(config, inputs({ fundingRate: 0 }));
+    if (!verdict.accepted) {
+      expect.unreachable('the base fixture should clear the gate');
+      return;
+    }
+
+    const { lastClose, stopPrice, scaleOutPrice, targetPrice } = verdict.candidate;
+    const r = Math.abs(lastClose - stopPrice);
+
+    expect(scaleOutPrice).toBeCloseTo(lastClose + config.exits.scaleOutAtR * r, 9);
+    expect(scaleOutPrice).toBeLessThan(targetPrice);
+    expect(scaleOutPrice).toBeGreaterThan(lastClose);
   });
 });

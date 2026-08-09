@@ -37,7 +37,9 @@ function candidate(overrides: Partial<EntryCandidate> = {}): EntryCandidate {
     entryBandLow: 64_700,
     entryBandHigh: 64_800,
     stopPrice: 64_000,
+    scaleOutPrice: 66_400,
     targetPrice: 67_200,
+    expectedFundingCostFraction: 0,
     atr: 400,
     conviction: { momentum: 0.9, trendStrength: 0.8, volume: 0.7, multiTimeframe: 0.8, total: 85 },
     validUntilMs: NOW + 3_600_000,
@@ -127,6 +129,7 @@ function build(
     guard?: FakeGuard;
     copy?: FakeCopyExecutor;
     publisher?: FakePublisher;
+    now?: number;
   } = {},
 ) {
   const config: Config = overrides.config ?? {
@@ -153,22 +156,31 @@ function build(
     instruments,
     readEquity: async () => overrides.equity ?? 400,
     readRankCushion: async () => overrides.rankCushion ?? null,
-    now: () => NOW,
+    now: () => overrides.now ?? NOW,
   });
 
   return { engine, state, ledger, killSwitch, guard, copy, publisher, config };
 }
 
 describe('correlationGroupFor', () => {
-  it('groups by policy, and gives an unlisted symbol its own bucket', () => {
-    // A single shared "other" bucket would make two unrelated small caps count
-    // as a correlated pair and refuse a trade we cannot justify refusing.
+  it('groups by policy, and pools every unlisted symbol into one bucket', () => {
     expect(correlationGroupFor(baseConfig, 'BTC-USDT-SWAP')).toBe('majors');
     expect(correlationGroupFor(baseConfig, 'SOL-USDT-SWAP')).toBe('layer1');
-    expect(correlationGroupFor(baseConfig, 'FARTCOIN-USDT-SWAP')).toBe('ungrouped:FARTCOIN');
-    expect(correlationGroupFor(baseConfig, 'AAA-USDT-SWAP')).not.toBe(
-      correlationGroupFor(baseConfig, 'BBB-USDT-SWAP'),
+  });
+
+  it('makes the memecoin complex count as ONE group, not five', () => {
+    // The reversal of an earlier decision, pinned as a test because the earlier
+    // behaviour was defensible in the abstract and wrong here. A live scan
+    // produced BOME, PEOPLE, PARTI, NEIRO and ESP — five long candidates, none
+    // of them in any hand-written group. Under per-symbol bucketing each one
+    // satisfied a cap of two on its own, so the cap permitted all five: one
+    // trade wearing five hats, while the book reported itself diversified.
+    const complex = ['BOME', 'PEOPLE', 'PARTI', 'NEIRO', 'ESP'].map((base) =>
+      correlationGroupFor(baseConfig, `${base}-USDT-SWAP`),
     );
+
+    expect(new Set(complex).size).toBe(1);
+    expect(complex[0]).toBe('HIGHBETA_ALT');
   });
 });
 
@@ -235,6 +247,7 @@ describe('the cycle publishes before it executes', () => {
           entryBandLow: 149,
           entryBandHigh: 150,
           stopPrice: 145,
+          scaleOutPrice: 160,
           targetPrice: 165,
           conviction: { ...candidate().conviction, total: 80 },
         }),
@@ -452,7 +465,7 @@ describe('signal accounting', () => {
 
 /** Read the published size percentage back out of the signal text. */
 function sizeOf(text: string): number {
-  const match = /size ([\d.]+)%/.exec(text);
+  const match = /Position ([\d.]+)%/.exec(text);
   if (match?.[1] === undefined) throw new Error(`no size in ${JSON.stringify(text)}`);
   return Number(match[1]);
 }
@@ -528,3 +541,177 @@ describe('EngineState', () => {
     expect(state.cooldownUntil('BTC-USDT-SWAP', NOW + 2000)).toBeUndefined();
   });
 });
+
+describe('exits are published too', () => {
+  /** An open long, tracked, with a stop already at breakeven. */
+  const openLong = (state: EngineState, overrides: Record<string, unknown> = {}) => {
+    state.open(
+      trackNewPosition({
+        instId: btc.symbol,
+        signalId: 'S-260812080000-BTC-L',
+        side: 'long',
+        entryPrice: 64_000,
+        initialStop: 63_000,
+        openedAtMs: NOW - 3_600_000,
+        venueSize: 24n,
+        ...overrides,
+      }),
+    );
+  };
+
+  it('publishes a scale-out as a signal of its own', async () => {
+    // Exits are trades. Roughly half of all fills are exits, and publishing
+    // entries alone leaves half the book with no corresponding signal.
+    const { engine, state, publisher } = build();
+    openLong(state);
+
+    // +2R: entry 64000, R = 1000, so 66000 triggers the scale-out.
+    await engine.runCycle(scanOf([], { lastPrices: new Map([[btc.symbol, 66_000]]) }));
+
+    const exits = publisher.published.filter((t) => t.includes('EXIT'));
+    expect(exits.some((t) => t.includes('CLOSE 25%'))).toBe(true);
+  });
+
+  it('publishes a stop ratchet, which moves no size but changes the published risk', async () => {
+    const { engine, state, publisher } = build();
+    openLong(state);
+    await engine.runCycle(scanOf([], { lastPrices: new Map([[btc.symbol, 66_000]]) }));
+
+    expect(publisher.published.some((t) => /EXIT LONG \| SL /.test(t))).toBe(true);
+  });
+
+  it('publishes a full close, and references the entry it closes', async () => {
+    // The reference is what makes the fill traceable to a signal. Without it an
+    // auditor sees an exit fill with no corresponding published instruction.
+    const { engine, state, publisher } = build();
+    openLong(state);
+
+    // Below the initial stop: a stop-out, which is terminal.
+    await engine.runCycle(scanOf([], { lastPrices: new Map([[btc.symbol, 62_000]]) }));
+
+    const close = publisher.published.find((t) => t.includes('CLOSE 100%'));
+    expect(close).toBeDefined();
+    expect(close).toContain('ref S-260812080000-BTC-L');
+  });
+
+  it('CLOSES THE POSITION EVEN IF PUBLISHING FAILS', async () => {
+    // The asymmetry with entries, and the most important property here. An
+    // entry that cannot be published is not traded. An exit that cannot be
+    // published still happens: gating a close on the ASP being reachable would
+    // mean a dead publisher leaves us holding a loser we are not allowed to cut.
+    const publisher = new FakePublisher();
+    publisher.fail = true;
+    const { engine, state, guard } = build({ publisher });
+    openLong(state);
+
+    const report = await engine.runCycle(scanOf([], { lastPrices: new Map([[btc.symbol, 62_000]]) }));
+
+    expect(guard.flattened).toHaveLength(1);
+    expect(state.positions()).toHaveLength(0);
+    expect(report.exits[0]?.actions[0]).toMatchObject({ kind: 'close_full' });
+  });
+
+  it('records a failed exit publish as an alert, so the gap is not silent', async () => {
+    const publisher = new FakePublisher();
+    publisher.fail = true;
+    const { engine, state, ledger } = build({ publisher });
+    openLong(state);
+    await engine.runCycle(scanOf([], { lastPrices: new Map([[btc.symbol, 62_000]]) }));
+
+    const alerts = ledger.recent(50).filter((row) => row.action === 'alert');
+    expect(alerts.some((row) => row.reason.includes('Law 6 gap'))).toBe(true);
+  });
+
+  it('does not count exit signals in the entry cycle accounting', async () => {
+    // SignalCycle's invariant is about ENTRY signals: generated == delivered +
+    // rejected. Exits are published after the fact and have no "rejected" state
+    // that leaves a position open, so counting them would break the invariant
+    // that catches a dropped entry.
+    const { engine, state } = build();
+    openLong(state);
+    const report = await engine.runCycle(scanOf([], { lastPrices: new Map([[btc.symbol, 66_000]]) }));
+
+    expect(report.signals).toEqual({ generated: 0, delivered: 0, rejected: 0 });
+  });
+
+  it('publishes nothing when exit publication is switched off', async () => {
+    const config: Config = {
+      ...baseConfig,
+      execution: { ...baseConfig.execution, maxLeverage: 5 },
+      publishing: { ...baseConfig.publishing, publishExits: false },
+    };
+    const { engine, state, publisher } = build({ config });
+    openLong(state);
+    await engine.runCycle(scanOf([], { lastPrices: new Map([[btc.symbol, 62_000]]) }));
+
+    expect(publisher.published).toHaveLength(0);
+  });
+});
+
+describe('the competition clock gates entries', () => {
+  const beforeStart = baseline().competition.startsAt - 3_600_000;
+  const inEndgame = baseline().competition.endsAt - 30 * 3_600_000;
+  const afterEnd = baseline().competition.endsAt + 3_600_000;
+
+  it('opens no position before the competition starts', async () => {
+    // A pre-start fill moves equity, does not score, and cannot be undone. It is
+    // the only gate here whose breach no later decision can repair.
+    const { engine, publisher, copy } = build({ now: beforeStart });
+    const report = await engine.runCycle(scanOf([candidate({ validUntilMs: beforeStart + 3_600_000 })]));
+
+    expect(publisher.published).toHaveLength(0);
+    expect(copy.executed).toHaveLength(0);
+    expect(report.standDownReason).toMatch(/has not started/);
+    expect(report.phase).toBe('before');
+  });
+
+  it('opens no position inside the last 48 hours', async () => {
+    // A trade opened here cannot reach its maximum hold before the snapshot, so
+    // it is a coinflip resolved by the clock rather than by the strategy.
+    const { engine, publisher } = build({ now: inEndgame });
+    const report = await engine.runCycle(scanOf([candidate({ validUntilMs: inEndgame + 3_600_000 })]));
+
+    expect(publisher.published).toHaveLength(0);
+    expect(report.standDownReason).toMatch(/endgame/);
+  });
+
+  it('opens no position after the snapshot', async () => {
+    const { engine, publisher } = build({ now: afterEnd });
+    const report = await engine.runCycle(scanOf([candidate({ validUntilMs: afterEnd + 3_600_000 })]));
+
+    expect(publisher.published).toHaveLength(0);
+    expect(report.standDownReason).toMatch(/competition is over/);
+  });
+
+  it('still MANAGES open positions outside the trading window', async () => {
+    // The same principle as the kill switch and the governor: an engine that
+    // stops managing its book has not become safe, it has become an abandoned
+    // book. Only entries are gated.
+    const { engine, state, guard } = build({ now: inEndgame });
+    state.open(
+      trackNewPosition({
+        instId: btc.symbol,
+        signalId: 'S-260812080000-BTC-L',
+        side: 'long',
+        entryPrice: 64_000,
+        initialStop: 63_000,
+        openedAtMs: inEndgame - 3_600_000,
+        venueSize: 24n,
+      }),
+    );
+
+    await engine.runCycle(scanOf([], { lastPrices: new Map([[btc.symbol, 62_000]]) }));
+    expect(guard.flattened).toHaveLength(1);
+  });
+
+  it('reports the phase on every cycle, so a quiet engine is explicable', async () => {
+    const { engine } = build();
+    const report = await engine.runCycle(scanOf([]));
+    expect(report.phase).toBe('open');
+  });
+});
+
+/** The unmodified config, for reading the competition clock in test setup. */
+function baseline(): Config {
+  return loadConfig('config/default.yaml');
+}

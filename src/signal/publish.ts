@@ -33,10 +33,60 @@ export interface SignalPlan {
   readonly entryLow: number;
   readonly entryHigh: number;
   readonly stopPrice: number;
+  /**
+   * TP1 — where 25% actually comes off, at +`scaleOutAtR`R.
+   *
+   * This is the field that made the old signal untrue. The published text
+   * carried one target, the 3:1 screening level, and described it as the plan.
+   * E5 has no target logic whatsoever: it scales out at +2R, moves to breakeven
+   * and trails the remainder. So the published intent and the actual behaviour
+   * diverged on every winning trade, which is what an auditor comparing signals
+   * to fills would see first.
+   */
+  readonly scaleOutPrice: number;
+  /**
+   * TP2 — the screening target at `minTargetStopRatio`.
+   *
+   * Not an order. It is the level that had to exist for the setup to qualify as
+   * a trade at all, and the trail may or may not reach it. Published because the
+   * payoff ratio a subscriber can check is computed against it.
+   */
   readonly targetPrice: number;
   /** Position size as a percentage of equity, e.g. 2.5 for 2.5%. */
   readonly sizePercent: number;
   readonly validUntilMs: number;
+}
+
+/**
+ * Published leverage.
+ *
+ * Not a new quantity and not a nominal figure: notional/equity IS sizePercent,
+ * so the two published fields are the same number in two units. The redundancy
+ * is deliberate — `validateSignal` asserts they agree, so a formatting change
+ * that touches one and not the other is caught at the gate rather than becoming
+ * a signal whose stated leverage contradicts its stated size.
+ *
+ * The canonical example in the spec reads `LONG 3x`. We publish the emergent
+ * value, typically 0.5-2x. Publishing a nominal 3x while placing 0.8x is
+ * precisely the published-does-not-equal-placed failure Law 6 exists to prevent.
+ */
+export function leverageFor(sizePercent: number): number {
+  return Number((sizePercent / 100).toFixed(2));
+}
+
+/**
+ * Absolute UTC expiry, to the minute.
+ *
+ * The spec's canonical form says "Valid for 6h". We publish an instant instead,
+ * for the same reason prices are absolute: a duration means one thing to the
+ * publisher and another to a reader who receives it forty minutes later, and
+ * "valid for 6h" read late is a signal acted on outside the window it described.
+ */
+export function formatInstant(ms: number): string {
+  if (!Number.isFinite(ms)) {
+    throw new SignalError(`cannot publish a validity instant of ${ms}`);
+  }
+  return `${new Date(ms).toISOString().slice(0, 16)}Z`;
 }
 
 export type ValidationResult =
@@ -86,6 +136,7 @@ export function roundPlan(plan: SignalPlan): SignalPlan {
     entryLow: roundPrice(plan.entryLow),
     entryHigh: roundPrice(plan.entryHigh),
     stopPrice: roundPrice(plan.stopPrice),
+    scaleOutPrice: roundPrice(plan.scaleOutPrice),
     targetPrice: roundPrice(plan.targetPrice),
     sizePercent: Number(plan.sizePercent.toFixed(2)),
   };
@@ -104,12 +155,120 @@ export function formatSignal(config: Config, plan: SignalPlan): string {
   const p = roundPlan(plan);
   const side = p.direction === 'long' ? 'LONG' : 'SHORT';
 
+  // Pipe-delimited, matching the spec's canonical shape. Three deliberate
+  // deviations from its example, each recorded here so they are decisions rather
+  // than drift:
+  //
+  //   - the instrument is `-USDT-SWAP`, not `-PERP`. It is the instId Trade Kit
+  //     places against, and Law 6 is that published equals placed. A subscriber
+  //     maps one name; we would otherwise publish an instrument we do not trade.
+  //   - validity is an absolute instant, not a duration. See `formatInstant`.
+  //   - the signal id is carried in the text. The spec's field list omits it,
+  //     but Law 6 requires a fill to be traceable to a signal FROM LOGS, and the
+  //     alternative — keying on the delivery jobId — cannot be built until the
+  //     publisher exists. 24 characters is a cheap price for traceability that
+  //     does not depend on an unbuilt component.
   return (
-    `${config.publishing.perpHeader} ${side} ${p.instId} ` +
-    `entry ${formatPrice(p.entryLow)}-${formatPrice(p.entryHigh)} ` +
-    `stop ${formatPrice(p.stopPrice)} target ${formatPrice(p.targetPrice)} ` +
-    `size ${p.sizePercent}% id ${p.signalId}`
+    `${config.publishing.perpHeader} ${p.instId} | ${side} ${leverageFor(p.sizePercent)}x | ` +
+    `Entry ${formatPrice(p.entryLow)}-${formatPrice(p.entryHigh)} | ` +
+    `SL ${formatPrice(p.stopPrice)} | ` +
+    `TP1 ${formatPrice(p.scaleOutPrice)} | TP2 ${formatPrice(p.targetPrice)} | ` +
+    `Position ${p.sizePercent}% | Valid ${formatInstant(p.validUntilMs)} | ${p.signalId}`
   );
+}
+
+/**
+ * An exit action, published.
+ *
+ * EXITS ARE TRADES. Every scale-out, ratchet, time stop and close produces a
+ * fill that OKX compares against our published signals, and roughly half of all
+ * fills are exits. Publishing entries alone leaves half the book uncorresponded
+ * and tells a subscriber to open a position it never tells them to close.
+ */
+export type ExitSignalKind =
+  | { readonly kind: 'close'; readonly percent: number }
+  | { readonly kind: 'stop'; readonly to: number };
+
+export interface ExitSignalPlan {
+  readonly exitId: string;
+  /** The entry signal this exit acts on. The audit trail runs through it. */
+  readonly refSignalId: string;
+  readonly instId: string;
+  readonly direction: Direction;
+  readonly action: ExitSignalKind;
+  /** The market price at which the action was taken. */
+  readonly price: number;
+  readonly reason: string;
+}
+
+/** Render an exit signal. Same header, so it classifies as `perp` identically. */
+export function formatExitSignal(config: Config, plan: ExitSignalPlan): string {
+  const side = plan.direction === 'long' ? 'LONG' : 'SHORT';
+  const action =
+    plan.action.kind === 'close'
+      ? `CLOSE ${Number(plan.action.percent.toFixed(2))}%`
+      : `SL ${formatPrice(plan.action.to)}`;
+
+  return (
+    `${config.publishing.perpHeader} ${plan.instId} | EXIT ${side} | ${action} | ` +
+    `@${formatPrice(plan.price)} | ref ${plan.refSignalId} | ${plan.exitId}`
+  );
+}
+
+/**
+ * The exit-signal gate.
+ *
+ * Thinner than `validateSignal` on purpose, and the asymmetry is the design.
+ * An entry signal is validated BEFORE the trade, so a failure costs a trade we
+ * had no obligation to take. An exit signal is validated AFTER the close has
+ * already happened — the position is gone either way — so the only thing a
+ * failure can achieve is telling us the record is wrong. It must therefore check
+ * the record and nothing else: no geometry, no payoff, nothing that could refuse
+ * to describe a close that has already occurred.
+ */
+export function validateExitSignal(config: Config, text: string, plan: ExitSignalPlan): ValidationResult {
+  const reasons: string[] = [];
+
+  if (!text.startsWith(config.publishing.perpHeader)) {
+    reasons.push(`text does not begin with the exact header ${JSON.stringify(config.publishing.perpHeader)}`);
+  }
+  if (text.length > config.publishing.maxSignalChars) {
+    reasons.push(`text is ${text.length} chars, over the ${config.publishing.maxSignalChars} limit`);
+  }
+  if (plan.exitId.trim() === '' || /\s/.test(plan.exitId)) {
+    reasons.push(`exit id ${JSON.stringify(plan.exitId)} must be non-empty and contain no whitespace`);
+  } else if (!text.includes(plan.exitId)) {
+    reasons.push(`text does not carry the exit id ${plan.exitId}`);
+  }
+  // The reference is what makes the exit traceable to the entry it closes. An
+  // exit signal without it is an orphan fill from the auditor's side.
+  if (!text.includes(plan.refSignalId)) {
+    reasons.push(`text does not reference the entry signal ${plan.refSignalId}`);
+  }
+  if (!text.includes(plan.instId)) {
+    reasons.push(`text does not name the instrument ${plan.instId}`);
+  }
+  if (plan.action.kind === 'close' && !(plan.action.percent > 0 && plan.action.percent <= 100)) {
+    reasons.push(`close percentage ${plan.action.percent} must fall in (0, 100]`);
+  }
+
+  return reasons.length === 0 ? { ok: true } : { ok: false, reasons };
+}
+
+/**
+ * Build an exit signal, or throw.
+ *
+ * Throwing is safe here in a way it would not be at the call site of a close:
+ * the caller publishes AFTER acting, and treats a throw as a failed record to be
+ * alerted on, never as a reason to leave a position open.
+ */
+export function buildExitSignal(config: Config, plan: ExitSignalPlan): string {
+  const text = formatExitSignal(config, plan);
+  const result = validateExitSignal(config, text, plan);
+  if (!result.ok) {
+    throw new SignalError(`refusing to publish exit ${plan.exitId}: ${result.reasons.join('; ')}`);
+  }
+  return text;
 }
 
 /**
@@ -185,7 +344,8 @@ export function validateSignal(
     ['entry low', p.entryLow],
     ['entry high', p.entryHigh],
     ['stop', p.stopPrice],
-    ['target', p.targetPrice],
+    ['TP1 scale-out', p.scaleOutPrice],
+    ['TP2 target', p.targetPrice],
   ] as const) {
     if (!text.includes(formatPrice(value))) {
       reasons.push(`text does not carry the absolute ${label} price ${formatPrice(value)}`);
@@ -216,9 +376,28 @@ export function validateSignal(
   if (p.direction === 'long') {
     if (p.stopPrice >= p.entryLow) reasons.push('long stop is not below the entry band');
     if (p.targetPrice <= p.entryHigh) reasons.push('long target is not above the entry band');
+    // TP1 is where 25% actually comes off, so it must be a level the trade
+    // reaches BEFORE the screening target. A TP1 beyond TP2 would publish a
+    // scale-out that can never fire before the level that justified the trade.
+    if (!(p.scaleOutPrice > p.entryHigh && p.scaleOutPrice < p.targetPrice)) {
+      reasons.push('long TP1 must sit above the entry band and below TP2');
+    }
   } else {
     if (p.stopPrice <= p.entryHigh) reasons.push('short stop is not above the entry band');
     if (p.targetPrice >= p.entryLow) reasons.push('short target is not below the entry band');
+    if (!(p.scaleOutPrice < p.entryLow && p.scaleOutPrice > p.targetPrice)) {
+      reasons.push('short TP1 must sit below the entry band and above TP2');
+    }
+  }
+
+  // Leverage and size are the same quantity in two units, and both are
+  // published. Checking that they agree is what stops a change to one of the two
+  // format strings producing a signal whose stated leverage contradicts its
+  // stated position size — the exact published-vs-placed divergence Law 6 exists
+  // to make impossible.
+  const leverage = leverageFor(p.sizePercent);
+  if (!text.includes(`${leverage}x`)) {
+    reasons.push(`text does not state the emergent leverage ${leverage}x implied by ${p.sizePercent}%`);
   }
 
   // Payoff must survive rounding. Deriving the target from the stop guarantees

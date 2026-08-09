@@ -26,7 +26,14 @@
  * text — `executeSignal` takes a string, not a plan.
  */
 
-import { requireMaxLeverage, type Config, type Stage } from '../config.js';
+import {
+  competitionPhase,
+  entriesPermitted,
+  requireMaxLeverage,
+  type CompetitionPhase,
+  type Config,
+  type Stage,
+} from '../config.js';
 import type { KillSwitch } from '../kill-switch.js';
 import type { Ledger } from '../ledger.js';
 import {
@@ -38,7 +45,15 @@ import {
   type GovernorAction,
   type OpenRisk,
 } from '../risk.js';
-import { buildSignal, SignalCycle, SignalError, roundPlan, type SignalPlan } from '../signal/publish.js';
+import {
+  buildExitSignal,
+  buildSignal,
+  SignalCycle,
+  SignalError,
+  roundPlan,
+  type ExitSignalPlan,
+  type SignalPlan,
+} from '../signal/publish.js';
 import { baseSymbol } from '../signal/scanner.js';
 import { evaluateExit, type ExitPlan, type MarketState } from '../signal/exits.js';
 import type { EntryCandidate } from '../signal/entry.js';
@@ -100,6 +115,8 @@ export interface EngineDeps {
 export interface CycleReport {
   readonly stage: Stage;
   readonly governor: GovernorAction;
+  /** Where the cycle found itself on the competition clock. */
+  readonly phase: CompetitionPhase;
   readonly equityUsdt: number;
   readonly peakEquityUsdt: number;
   readonly exits: readonly ExitPlan[];
@@ -109,13 +126,28 @@ export interface CycleReport {
   readonly standDownReason: string | null;
 }
 
-/** Correlation group for an instrument, from policy. */
+/**
+ * Correlation group for an instrument, from policy.
+ *
+ * Everything unclassified lands in ONE shared bucket. The previous behaviour
+ * gave each unlisted symbol a private group, which meant the cap could not bind
+ * on precisely the part of the universe where it was needed: E3 selects momentum
+ * extremes, the extremes in crypto are the memecoin complex, and none of them
+ * appear in any hand-written group. A live scan produced five of them at once,
+ * every one satisfying a cap of two on its own.
+ */
 export function correlationGroupFor(config: Config, instId: string): string {
   const base = baseSymbol(instId);
   for (const [group, members] of Object.entries(config.correlationGroups)) {
     if (members.includes(base)) return group;
   }
-  return `${config.ungroupedPrefix}:${base}`;
+  return config.ungroupedGroup;
+}
+
+/** Exit id: unique per position, per cycle, per kind of action. */
+function exitIdFor(instId: string, nowMs: number, code: 'S' | 'C' | 'M'): string {
+  const stamp = new Date(nowMs).toISOString().replace(/[-:T.]/g, '').slice(2, 14);
+  return `X-${stamp}-${baseSymbol(instId)}-${code}`;
 }
 
 export class Engine {
@@ -148,8 +180,11 @@ export class Engine {
       );
 
       // 2. Exits, always. A halted engine that stops managing open positions has
-      //    not become safe — it has become an abandoned book.
-      const exits = await this.#manageExits(scan, nowMs);
+      //    not become safe — it has become an abandoned book. The competition
+      //    phase reaches E5 because Part X is expressed as exit behaviour: at
+      //    T-24h losers close and winners move to a tightened trail.
+      const phase = competitionPhase(config, nowMs);
+      const exits = await this.#manageExits(scan, nowMs, phase);
 
       // 3. Equity, stage, governor.
       const equityUsdt = await this.#deps.readEquity();
@@ -164,6 +199,7 @@ export class Engine {
         equityUsdt,
         peakEquityUsdt,
         exits,
+        phase,
       } as const;
 
       const standDown = (reason: string): CycleReport => {
@@ -182,6 +218,23 @@ export class Engine {
       };
 
       // 4. Entry gates, in order of how badly we want them to stop us.
+      //
+      //    The competition clock comes FIRST, ahead of every risk gate, because
+      //    it is the only one whose breach cannot be undone by any later
+      //    decision. A pre-start fill moves equity and does not score; a
+      //    post-T-48h fill cannot reach its maximum hold before the snapshot.
+      //    Every other gate here is about whether a trade is wise. This one is
+      //    about whether it is permitted to exist.
+      if (!entriesPermitted(phase)) {
+        return standDown(
+          phase === 'before'
+            ? `competition has not started (opens ${new Date(config.competition.startsAt).toISOString()})`
+            : phase === 'after'
+              ? 'competition is over — nothing traded now scores'
+              : `endgame phase "${phase}" — no new positions inside the last ` +
+                `${config.competition.endgame.noNewEntriesHoursBeforeEnd}h`,
+        );
+      }
       if (governor === 'stopForCompetition') {
         return standDown('governor has stopped trading for the competition');
       }
@@ -223,7 +276,7 @@ export class Engine {
    * extreme including this bar, or the trail lags a cycle behind the price that
    * justified it.
    */
-  async #manageExits(scan: ScanResult, nowMs: number): Promise<readonly ExitPlan[]> {
+  async #manageExits(scan: ScanResult, nowMs: number, phase: CompetitionPhase): Promise<readonly ExitPlan[]> {
     const { config, state, ledger } = this.#deps;
     const plans: ExitPlan[] = [];
 
@@ -248,7 +301,7 @@ export class Engine {
         atr,
         nowMs,
       };
-      const plan = evaluateExit(config, advanced, market);
+      const plan = evaluateExit(config, advanced, market, phase);
       plans.push(plan);
 
       for (const action of plan.actions) {
@@ -258,6 +311,10 @@ export class Engine {
           const instrument = this.#instrument(tracked.instId);
           await this.#deps.executor.flatten(instrument, `${advanced.signalId}: ${action.reason}`);
           state.close(tracked.instId, action.cooldownUntilMs);
+          await this.#publishExit(advanced, nowMs, lastPrice, action.reason, 'C', {
+            kind: 'close',
+            percent: advanced.remainingFraction * 100,
+          });
           break; // Terminal. Nothing after a close applies to this position.
         }
 
@@ -273,6 +330,10 @@ export class Engine {
             size: null,
             stop: String(action.to),
             reason: action.reason,
+          });
+          await this.#publishExit(advanced, nowMs, lastPrice, action.reason, 'M', {
+            kind: 'stop',
+            to: action.to,
           });
         }
 
@@ -293,11 +354,87 @@ export class Engine {
             stop: null,
             reason: `partial: ${action.reason}`,
           });
+          await this.#publishExit(advanced, nowMs, lastPrice, action.reason, 'S', {
+            kind: 'close',
+            percent: action.fraction * 100,
+          });
         }
       }
     }
 
     return plans;
+  }
+
+  /**
+   * Publish an exit action AFTER it has been carried out.
+   *
+   * The ordering is the inverse of an entry, and deliberately so.
+   *
+   * An entry publishes first and trades only if delivery succeeded, because an
+   * untraceable entry is a rule breach we chose to commit and declining to trade
+   * costs nothing but an opportunity. An exit has already happened by the time
+   * this runs. Gating the close on the publisher being reachable would mean a
+   * dead ASP leaves us unable to cut a losing position — trading eligibility
+   * bought with unbounded risk, which is not a trade worth making.
+   *
+   * So a failure here NEVER propagates. It is recorded as an alert, because a
+   * fill with no published signal is a real correspondence gap that someone has
+   * to know about; it is simply not a reason to have kept the position.
+   */
+  async #publishExit(
+    position: TrackedPosition,
+    nowMs: number,
+    lastPrice: number,
+    reason: string,
+    code: 'S' | 'C' | 'M',
+    action: ExitSignalPlan['action'],
+  ): Promise<void> {
+    const { config, ledger } = this.#deps;
+    if (!config.publishing.publishExits) return;
+
+    const plan: ExitSignalPlan = {
+      exitId: exitIdFor(position.instId, nowMs, code),
+      refSignalId: position.signalId,
+      instId: position.instId,
+      direction: position.side,
+      action,
+      price: lastPrice,
+      reason,
+    };
+
+    try {
+      const text = buildExitSignal(config, plan);
+      await this.#deps.publisher.publish(text);
+      ledger.append({
+        action: 'signal_published',
+        engine: 'engine-loop',
+        venue: this.#deps.executor.venue,
+        instrument: position.instId,
+        signal: plan.exitId,
+        price: String(lastPrice),
+        size: null,
+        stop: action.kind === 'stop' ? String(action.to) : null,
+        reason: text,
+        detail: { exitOf: position.signalId },
+      });
+    } catch (error) {
+      // An unpublished exit is a correspondence gap, not an emergency. It is
+      // loud in the ledger and invisible to the position, which is correct: the
+      // trade is already done and cannot be undone by a failed record.
+      ledger.append({
+        action: 'alert',
+        engine: 'engine-loop',
+        venue: this.#deps.executor.venue,
+        instrument: position.instId,
+        signal: position.signalId,
+        price: String(lastPrice),
+        size: null,
+        stop: null,
+        reason:
+          `EXIT PUBLISHED FAILED for ${plan.exitId} (${reason}): ${(error as Error).message}. ` +
+          'The fill has no corresponding signal — Law 6 gap, investigate before the next cycle.',
+      });
+    }
   }
 
   async #flattenAll(reason: string): Promise<void> {
@@ -333,6 +470,7 @@ export class Engine {
       instrument: p.instId,
       correlationGroup: correlationGroupFor(config, p.instId),
       riskUsdt: openRiskUsdt(this.#instrument(p.instId), p),
+      side: p.side,
     }));
 
     // Strongest conviction first. Position slots and portfolio heat are finite,
@@ -397,6 +535,7 @@ export class Engine {
         entryLow: candidate.entryBandLow,
         entryHigh: candidate.entryBandHigh,
         stopPrice: candidate.stopPrice,
+        scaleOutPrice: candidate.scaleOutPrice,
         targetPrice: candidate.targetPrice,
         sizePercent,
         validUntilMs: candidate.validUntilMs,
@@ -487,6 +626,7 @@ export class Engine {
         openRisk.push({
           instrument: candidate.instId,
           correlationGroup: correlationGroupFor(config, candidate.instId),
+          side: candidate.direction,
           riskUsdt: openRiskUsdt(this.#instrument(candidate.instId), {
             entryPrice,
             currentStop: plan.stopPrice,

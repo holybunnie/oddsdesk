@@ -314,3 +314,83 @@ describe('the whole sequence on one winning trade', () => {
     expect(previousStop).toBeGreaterThan(position.entryPrice);
   });
 });
+
+describe('PART X — the endgame', () => {
+  it('closes a losing position at T-24h rather than carrying it into the snapshot', () => {
+    // Unrealised PnL counts at the final snapshot. A loser held into it is not a
+    // trade still working — it is a realised loss taken at the worst moment,
+    // and it is what took DeepSeek from +125% to +4.89%.
+    const plan = evaluateExit(config, long(), market({ lastPrice: 98 }), 'closeLosers');
+
+    expect(plan.actions[0]).toMatchObject({ kind: 'close_full' });
+    expect(plan.actions[0]).toMatchObject({ reason: expect.stringMatching(/endgame/) });
+  });
+
+  it('closes a FLAT position too — zero is not a winner', () => {
+    const plan = evaluateExit(config, long(), market({ lastPrice: 100 }), 'closeLosers');
+    expect(plan.actions[0]).toMatchObject({ kind: 'close_full' });
+  });
+
+  it('does NOT close a winner — it trails it into the snapshot', () => {
+    // The trail converts a coinflip into a floor while leaving the upside
+    // intact, which is the entire argument for holding a winner through.
+    const plan = evaluateExit(
+      config,
+      long(),
+      market({ lastPrice: 112, highestHighSinceEntry: 112 }),
+      'closeLosers',
+    );
+    expect(plan.actions.some((a) => a.kind === 'close_full')).toBe(false);
+    expect(plan.actions.some((a) => a.kind === 'move_stop')).toBe(true);
+  });
+
+  it('trails a SMALL winner in the endgame that it would leave alone normally', () => {
+    // Below the scale-out threshold there is normally room to run, because
+    // there is time for a small winner to become a large one. Inside the last
+    // day there is not, and an unprotected +0.5R at the snapshot is a gain left
+    // to chance.
+    const small = long();
+    const state = market({ lastPrice: 102.5, highestHighSinceEntry: 102.5 });
+
+    expect(evaluateExit(config, small, state, 'open').actions).toEqual([{ kind: 'hold' }]);
+    expect(evaluateExit(config, small, state, 'closeLosers').actions.some((a) => a.kind === 'move_stop')).toBe(true);
+  });
+
+  it('uses a tighter trail in the endgame than the tightened trail', () => {
+    const winner = long();
+    const state = market({ lastPrice: 130, highestHighSinceEntry: 130 });
+
+    const normal = stopFrom(evaluateExit(config, winner, state, 'open'));
+    const endgame = stopFrom(evaluateExit(config, winner, state, 'closeLosers'));
+
+    expect(endgame).toBeGreaterThan(normal);
+    expect(config.competition.endgame.chandelierAtrMultiple).toBeLessThan(
+      config.exits.tightenedChandelierAtrMultiple,
+    );
+  });
+
+  it('still honours a hit stop before any endgame rule', () => {
+    // The endgame changes when we choose to exit. It never overrides an exit
+    // that has already been forced.
+    const plan = evaluateExit(
+      config,
+      long({ currentStop: 99 }),
+      market({ lastPrice: 98 }),
+      'closeLosers',
+    );
+    expect(plan.actions[0]).toMatchObject({ reason: expect.stringMatching(/stop hit/) });
+  });
+
+  it('leaves every other phase behaving exactly as before', () => {
+    const p = long();
+    const m = market({ lastPrice: 98 });
+    for (const phase of ['before', 'open', 'noNewEntries'] as const) {
+      expect(evaluateExit(config, p, m, phase).actions).toEqual([{ kind: 'hold' }]);
+    }
+  });
+});
+
+/** The stop a plan would leave behind, for comparing trail tightness. */
+function stopFrom(plan: ReturnType<typeof evaluateExit>): number {
+  return plan.actions.reduce<number>((stop, action) => (action.kind === 'move_stop' ? action.to : stop), 0);
+}

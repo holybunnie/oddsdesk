@@ -46,7 +46,12 @@ export interface EntryCandidate {
   readonly entryBandLow: number;
   readonly entryBandHigh: number;
   readonly stopPrice: number;
+  /** TP1 — where E5 takes 25% off, at +`scaleOutAtR`R. */
+  readonly scaleOutPrice: number;
+  /** TP2 — the screening target, at the minimum payoff ratio NET of carry. */
   readonly targetPrice: number;
+  /** Expected funding paid over the hold, as a fraction of notional. */
+  readonly expectedFundingCostFraction: number;
   readonly atr: number;
   readonly conviction: ConvictionBreakdown;
   readonly validUntilMs: number;
@@ -156,6 +161,43 @@ export interface EntryInputs {
   readonly nowMs: number;
   /** Instruments still inside a post-stop cooldown, with their expiry. */
   readonly cooldownUntilMs?: number;
+  /**
+   * Current funding rate, signed as the venue reports it.
+   *
+   * Required. E2 already reads this as a crowding filter; E4 needs it as a COST,
+   * and making it optional would let a caller that forgot it produce a signal
+   * priced as though carry were free — which is the failure this field exists
+   * to prevent, arriving silently.
+   */
+  readonly fundingRate: number;
+}
+
+/**
+ * Expected funding paid over the trade, as a fraction of notional.
+ *
+ * Funding is not merely a signal about crowding — it is money, charged every
+ * window for as long as the position is open. The hold band runs to
+ * `maxHoldHours`, so the honest worst case is the number of windows that fits
+ * inside it. Assuming the worst case rather than an average is deliberate: a
+ * trade must clear its payoff hurdle on the carry it might actually pay, not on
+ * the carry it would pay if closed early.
+ *
+ * Only ADVERSE funding is charged. Funding in our favour is real income, but
+ * pricing a trade on income that inverts the moment the crowd rotates is how a
+ * cost model becomes an optimistic one.
+ */
+export function expectedFundingCostFraction(config: Config, fundingRate: number, direction: Direction): number {
+  if (!config.regime.fundingCharged) return 0;
+  if (!Number.isFinite(fundingRate)) {
+    throw new EntryError(`funding rate must be finite to price carry, got ${fundingRate}`);
+  }
+
+  // Longs pay when funding is positive, shorts when it is negative.
+  const adverse = direction === 'long' ? fundingRate : -fundingRate;
+  if (adverse <= 0) return 0;
+
+  const windows = Math.ceil(config.exits.maxHoldHours / config.regime.fundingWindowHours);
+  return adverse * windows;
 }
 
 /**
@@ -220,11 +262,42 @@ export function evaluateEntry(config: Config, inputs: EntryInputs): EntryVerdict
   const stopPrice = initialStopFor(config, direction, reference, atrValue);
   const riskDistance = Math.abs(reference - stopPrice);
 
-  // Target at the minimum acceptable payoff ratio. If a setup cannot offer it,
-  // it is not a trade — and here it always can, because the target is derived
-  // from the stop rather than read off a chart level.
-  const targetDistance = config.risk.minTargetStopRatio * riskDistance;
+  // Carry. Expressed as a price distance so it can be added to the target: the
+  // trade must clear the payoff ratio on the move NET of funding, not gross.
+  //
+  // Without this, funding was a filter and never a cost. At the old 0.0005
+  // threshold and a 36h hold, an "acceptable" trade paid up to 0.25% of notional
+  // — against a 6% total fee budget spread over ~40 trades, that is 1.7 trades
+  // of budget consumed by one position, while the fee tracker reported 2 bps
+  // maker and looked healthy. The cost was real and invisible in every number
+  // the system produced.
+  const fundingCostDistance = reference * expectedFundingCostFraction(config, inputs.fundingRate, direction);
+
+  // Target at the minimum acceptable payoff ratio, pushed out by the carry. If a
+  // setup cannot offer it, it is not a trade — and unlike the gross version this
+  // can genuinely fail to be offerable, which is the point: an expensive-to-hold
+  // instrument now needs a bigger move to qualify rather than qualifying anyway.
+  const targetDistance = config.risk.minTargetStopRatio * riskDistance + fundingCostDistance;
   const targetPrice = direction === 'long' ? reference + targetDistance : reference - targetDistance;
+
+  // Where 25% actually comes off. E5 scales out at +2R and trails the rest, so
+  // this — not the target above — is the first thing that happens to a winner,
+  // and publishing the target as though it were the plan is what made the old
+  // signal describe a trade we never took.
+  const scaleOutDistance = config.exits.scaleOutAtR * riskDistance;
+  const scaleOutPrice = direction === 'long' ? reference + scaleOutDistance : reference - scaleOutDistance;
+
+  if (scaleOutPrice <= 0) {
+    return {
+      accepted: false,
+      rejection: {
+        instId: ranked.instId,
+        direction,
+        reasons: [`scale-out level computed at ${scaleOutPrice}, which is not a tradable level`],
+        conviction,
+      },
+    };
+  }
 
   if (targetPrice <= 0) {
     return {
@@ -248,7 +321,9 @@ export function evaluateEntry(config: Config, inputs: EntryInputs): EntryVerdict
       entryBandLow,
       entryBandHigh,
       stopPrice,
+      scaleOutPrice,
       targetPrice,
+      expectedFundingCostFraction: fundingCostDistance / reference,
       atr: atrValue,
       conviction,
       validUntilMs: nowMs + config.entry.validityHours * 3_600_000,

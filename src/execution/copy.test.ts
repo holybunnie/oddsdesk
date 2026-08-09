@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { loadConfig, type Config } from '../config.js';
-import { formatSignal, type SignalPlan } from '../signal/publish.js';
+import { formatExitSignal, formatSignal, type SignalPlan } from '../signal/publish.js';
 import type { Instrument, OrderRequest, OrderResult, Position } from './adapter.js';
 import type { FeedFreshness, GuardedExecutor } from './guarded.js';
 import {
@@ -9,6 +9,7 @@ import {
   InMemorySignalJournal,
   clientOrderIdFor,
   contractsFor,
+  parseExitSignal,
   parseSignal,
   priceToMinor,
   type AccountView,
@@ -44,12 +45,13 @@ const plan: SignalPlan = {
   entryLow: 64700,
   entryHigh: 64800,
   stopPrice: 64000,
+  scaleOutPrice: 66400, // +2R off the band top
   targetPrice: 67200,
   sizePercent: 40,
-  validUntilMs: 2_000_000,
+  validUntilMs: Date.UTC(2026, 7, 12, 13, 0, 0),
 };
 
-const NOW = 1_000_000;
+const NOW = Date.UTC(2026, 7, 12, 9, 0, 0);
 const feeds: readonly FeedFreshness[] = [{ name: 'ohlc', lastUpdateMs: NOW }];
 
 /** Records what reached the guard, so the test can assert on the actual order. */
@@ -124,11 +126,14 @@ describe('parseSignal', () => {
       signalId: plan.signalId,
       instId: plan.instId,
       direction: 'long',
+      leverage: 0.4,
       entryLow: plan.entryLow,
       entryHigh: plan.entryHigh,
       stopPrice: plan.stopPrice,
+      scaleOutPrice: plan.scaleOutPrice,
       targetPrice: plan.targetPrice,
       sizePercent: plan.sizePercent,
+      validUntilMs: plan.validUntilMs,
     });
   });
 
@@ -249,7 +254,10 @@ describe('CopyExecutor', () => {
 
     expect(outcome.status).toBe('submitted');
     expect(guard.last.stopPrice).toBe(priceToMinor(plan.stopPrice, 1));
-    expect(guard.last.targetPrice).toBe(priceToMinor(plan.targetPrice, 1));
+    // NO attached take-profit, deliberately. E5 scales out at +2R and trails
+    // the rest; a venue TP at TP2 would close the whole position at 3R and leave
+    // the engine trailing a stop on a position that no longer exists.
+    expect(guard.last.targetPrice).toBeNull();
     expect(guard.last.side).toBe('buy');
     expect(guard.last.type).toBe('limit');
     expect(guard.last.route).toBe('routeB');
@@ -263,7 +271,14 @@ describe('CopyExecutor', () => {
     expect(guard.last.limitPrice).toBe(priceToMinor(plan.entryHigh, 1));
 
     const config = configWith();
-    const short: SignalPlan = { ...plan, signalId: 'S-2-BTC-S', direction: 'short', stopPrice: 65500, targetPrice: 61700 };
+    const short: SignalPlan = {
+      ...plan,
+      signalId: 'S-2-BTC-S',
+      direction: 'short',
+      stopPrice: 65500,
+      scaleOutPrice: 63100,
+      targetPrice: 61700,
+    };
     const shortRun = makeExecutor();
     await shortRun.executor.execute(formatSignal(config, short), NOW, feeds);
     expect(shortRun.guard.last.limitPrice).toBe(priceToMinor(plan.entryLow, 1));
@@ -387,14 +402,14 @@ describe('CopyExecutor', () => {
     const delivered = NOW - 10 * 60_000;
     const outcome = await executor.execute(text(), delivered, feeds);
 
-    expect(outcome).toMatchObject({ status: 'refused', reason: expect.stringMatching(/expired/) });
+    expect(outcome).toMatchObject({ status: 'refused', reason: expect.stringMatching(/delivered .* ago/) });
   });
 
   it('re-runs the publication gate on read-back, catching an altered signal', async () => {
     // The text checks pass tautologically, but the geometry ones do not. An
     // altered stop is refused at the executor rather than traded on trust.
     const config = configWith();
-    const tampered = formatSignal(config, plan).replace('stop 64000', 'stop 65000');
+    const tampered = formatSignal(config, plan).replace('SL 64000', 'SL 65000');
     const { executor, guard } = makeExecutor();
     const outcome = await executor.execute(tampered, NOW, feeds);
 
@@ -426,3 +441,127 @@ describe('CopyExecutor', () => {
     });
   });
 });
+
+describe('the competition window, at the last gate before the venue', () => {
+  const outside = (ms: number) => {
+    const { executor, guard } = makeExecutorAt(ms);
+    return { executor, guard };
+  };
+
+  it('refuses to open a position before the competition starts', async () => {
+    // The engine gates this too. Both, deliberately: this is the last refusal
+    // before the venue, and a pre-start fill moves equity, does not score, and
+    // cannot be undone. The same reasoning that puts requireMaxLeverage in two
+    // places puts this here.
+    const before = baseConfig.competition.startsAt - 3_600_000;
+    const { executor, guard } = outside(before);
+    const outcome = await executor.execute(text(), before, feeds);
+
+    expect(outcome).toMatchObject({ status: 'refused', reason: expect.stringMatching(/competition phase/) });
+    expect(guard.submitted).toHaveLength(0);
+  });
+
+  it('refuses after the snapshot', async () => {
+    const after = baseConfig.competition.endsAt + 3_600_000;
+    const { executor, guard } = outside(after);
+    expect((await executor.execute(text(), after, feeds)).status).toBe('refused');
+    expect(guard.submitted).toHaveLength(0);
+  });
+
+  it('refuses inside the endgame, when the engine should not have published at all', async () => {
+    // Reaching this refusal means an entry signal was published inside the
+    // endgame, which is itself a fault. The executor still declines, because a
+    // second gate exists precisely for the case where the first one failed.
+    const endgame = baseConfig.competition.endsAt - 30 * 3_600_000;
+    const { executor } = outside(endgame);
+    expect((await executor.execute(text(), endgame, feeds)).status).toBe('refused');
+  });
+});
+
+describe('the published expiry is authoritative', () => {
+  it('refuses a signal past the instant printed in its own text', async () => {
+    // The published expiry is what a subscriber reading the signal would
+    // honour. Acting after it would make our fills diverge from our own
+    // published instruction.
+    const expired: SignalPlan = { ...plan, validUntilMs: NOW - 1 };
+    const { executor } = makeExecutor();
+    const outcome = await executor.execute(formatSignal(configWith(), expired), NOW, feeds);
+
+    expect(outcome).toMatchObject({ status: 'refused', reason: expect.stringMatching(/expired/) });
+  });
+});
+
+describe('parseExitSignal', () => {
+  it('round-trips a scale-out, a full close and a stop move', () => {
+    // We never act on these — our own exits execute directly and the text is
+    // the record. The round trip exists because a format we publish but cannot
+    // read back is one we have no evidence a subscriber can read either.
+    const config = configWith();
+    const base = {
+      exitId: 'X-2608091400-BTC-S',
+      refSignalId: plan.signalId,
+      instId: plan.instId,
+      direction: 'long' as const,
+      price: 66400,
+      reason: 'scale out',
+    };
+
+    for (const action of [
+      { kind: 'close', percent: 25 } as const,
+      { kind: 'close', percent: 100 } as const,
+      { kind: 'stop', to: 64800 } as const,
+    ]) {
+      const parsed = parseExitSignal(config, formatExitSignal(config, { ...base, action }));
+      expect(parsed.action).toEqual(action);
+      expect(parsed.refSignalId).toBe(plan.signalId);
+      expect(parsed.price).toBe(66400);
+    }
+  });
+
+  it('does not mistake an exit signal for an entry', () => {
+    // Both carry the same header, so the grammars must be disjoint. A parser
+    // that read an exit as an entry would open a position on a close.
+    const config = configWith();
+    const exit = formatExitSignal(config, {
+      exitId: 'X-1',
+      refSignalId: plan.signalId,
+      instId: plan.instId,
+      direction: 'long',
+      action: { kind: 'close', percent: 100 },
+      price: 66400,
+      reason: 'stop hit',
+    });
+
+    expect(() => parseSignal(config, exit)).toThrow(CopyExecutorError);
+    expect(() => parseExitSignal(config, text())).toThrow(CopyExecutorError);
+  });
+});
+
+describe('published leverage is checked on read-back', () => {
+  it('refuses a signal whose leverage and size disagree', async () => {
+    // Two published fields carrying one quantity. If they disagree the text was
+    // altered or the formatters drifted; either way both numbers are suspect
+    // and picking one is exactly what this executor must never do.
+    const tampered = text().replace('LONG 0.4x', 'LONG 3x');
+    const { executor, guard } = makeExecutor();
+    const outcome = await executor.execute(tampered, NOW, feeds);
+
+    expect(outcome).toMatchObject({ status: 'refused' });
+    expect(guard.submitted).toHaveLength(0);
+  });
+});
+
+/** An executor whose clock sits at a chosen instant, for the window tests. */
+function makeExecutorAt(nowMs: number) {
+  const guard = new FakeGuard();
+  const executor = new CopyExecutor({
+    config: configWith(),
+    executor: guard as unknown as GuardedExecutor,
+    account: new FakeAccount(),
+    instruments,
+    journal: new InMemorySignalJournal(),
+    maxSignalAgeMs: 5 * 60_000,
+    now: () => nowMs,
+  });
+  return { executor, guard };
+}

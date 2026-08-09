@@ -16,6 +16,7 @@ const NOW = Date.UTC(2026, 7, 12, 9, 0, 0);
 const emptyReport: CycleReport = {
   stage: 1,
   governor: 'normal',
+  phase: 'open',
   equityUsdt: 400,
   peakEquityUsdt: 400,
   exits: [],
@@ -64,6 +65,7 @@ function diagnostics(): ScanDiagnostics {
     rejected: [],
     regimePassing: 0,
     regimeConsidered: 0,
+    universeRejections: [],
   };
 }
 

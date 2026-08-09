@@ -99,6 +99,15 @@ export interface OpenRisk {
   readonly instrument: string;
   readonly correlationGroup: string;
   readonly riskUsdt: number;
+  /**
+   * Which way the position faces.
+   *
+   * Required, not optional. The directional cap is only meaningful if every
+   * open position declares a side, and a default would let a caller that
+   * forgot to supply one quietly disable the cap for that position — which is
+   * precisely the position it would then fail to count.
+   */
+  readonly side: 'long' | 'short';
 }
 
 export interface SizingRequest {
@@ -210,6 +219,20 @@ export function computeSize(config: Config, request: SizingRequest): SizingResul
       'correlation_group',
       `already holding ${inGroup} positions in correlation group "${correlationGroup}" ` +
         `(limit ${config.risk.maxPositionsPerCorrelationGroup})`,
+    );
+  }
+
+  // Directional concentration. The group cap above catches instruments we
+  // classified as related; this catches the ones we did not. E3 selects momentum
+  // extremes, and the extremes are usually one complex moving together — so a
+  // book that satisfies every group cap can still be a single bet placed three
+  // times, which is exactly the shape that empties an account in a reversal.
+  const sameSide = openRisk.filter((p) => p.side === side).length;
+  if (sameSide >= config.risk.maxPositionsPerSide) {
+    throw new RiskRefusal(
+      'directional_cap',
+      `already holding ${sameSide} ${side} positions (limit ${config.risk.maxPositionsPerSide}) — ` +
+        'a third position on the same side is concentration, not diversification',
     );
   }
 

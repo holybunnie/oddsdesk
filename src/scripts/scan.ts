@@ -31,8 +31,32 @@ async function main(): Promise<void> {
   console.log(`   from ${scan.liveUsdtPerps} live USDT perps`);
   console.log(
     `   filters: >= $${(config.universe.minQuoteVolume24hUsdt / 1e6).toFixed(0)}M 24h volume, ` +
-      `spread <= ${config.universe.maxSpreadBps}bps`,
+      `spread <= ${config.universe.maxSpreadBps}bps, ` +
+      `min order <= $${config.universe.minTradableNotionalUsdt}`,
   );
+
+  // The rejection breakdown, because the reasons are not interchangeable. An
+  // instrument dropped for volume comes back if the threshold is loosened; one
+  // dropped for minimum size never comes back at this account size. The second
+  // number is the honest measure of how much of the venue 320 USDT can reach,
+  // and it is the number that tests whether "breadth is the strategy" is true.
+  const byReason = new Map<string, number>();
+  for (const rejection of scan.universeRejections) {
+    byReason.set(rejection.reason, (byReason.get(rejection.reason) ?? 0) + 1);
+  }
+  const breakdown = [...byReason.entries()].sort((a, b) => b[1] - a[1]);
+  console.log(`   rejected: ${breakdown.map(([reason, n]) => `${reason} ${n}`).join(', ') || 'none'}`);
+
+  const unaffordable = scan.universeRejections.filter((r) => r.reason === 'min_size');
+  if (unaffordable.length > 0) {
+    console.log(
+      `   ${unaffordable.length} instrument(s) are UNREACHABLE at this size, not merely filtered:`,
+    );
+    for (const item of unaffordable.slice(0, 10)) {
+      console.log(`         ${item.instId.replace('-USDT-SWAP', '').padEnd(12)} ${item.detail}`);
+    }
+    if (unaffordable.length > 10) console.log(`         ... and ${unaffordable.length - 10} more`);
+  }
 
   if (scan.universeSize === 0) {
     console.log('\nNo instruments passed E1. Nothing to rank.');
@@ -82,9 +106,15 @@ async function main(): Promise<void> {
     console.log(`  ENTRY ${symbol} ${c.direction.padEnd(5)} conviction ${c.conviction.total.toFixed(1)}`);
     console.log(
       `         band ${fmt(c.entryBandLow)} - ${fmt(c.entryBandHigh)}  ` +
-        `stop ${fmt(c.stopPrice)}  target ${fmt(c.targetPrice)}  ` +
+        `stop ${fmt(c.stopPrice)}  TP1 ${fmt(c.scaleOutPrice)}  TP2 ${fmt(c.targetPrice)}  ` +
         `(broke ${fmt(c.breakoutLevel)}, atr ${fmt(c.atr)})`,
     );
+    if (c.expectedFundingCostFraction > 0) {
+      console.log(
+        `         carry: ${(c.expectedFundingCostFraction * 100).toFixed(3)}% of notional over the ` +
+          `${config.exits.maxHoldHours}h max hold, already charged into TP2`,
+      );
+    }
     console.log(
       `         components: mom ${pct(c.conviction.momentum)} adx ${pct(c.conviction.trendStrength)} ` +
         `vol ${pct(c.conviction.volume)} 4h ${pct(c.conviction.multiTimeframe)}`,

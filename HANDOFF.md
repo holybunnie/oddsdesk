@@ -1,6 +1,7 @@
 # AlphaGate — Handoff
 
-**Last updated:** 2026-08-09 (session 6 — driver, scan pipeline and journal; the agent runs)
+**Last updated:** 2026-08-09 (session 7 — exit publication, the competition clock,
+the directional cap, funding as a cost, and the Part X endgame)
 **Competition:** OKX.AI Hackathon Season 1
 **Registration closes:** Aug 11 12:00 UTC+8 — **the only irreversible deadline**
 **Trading window:** Aug 11 12:00 → Aug 25 12:00 UTC+8
@@ -35,17 +36,24 @@ until the publishing service exists.
 
 ### Trading half — what works, and what has never run
 
-Verified against live OKX on 2026-08-09: 423 instruments in → 79 passed the
-liquidity filter → 11 reached the entry gate → **5 signals** (BOME, PEOPLE,
-PARTI, NEIRO, ESP, all long). Real prices, real ATRs, real conviction scores.
+Verified against live OKX on 2026-08-09 (second run, after session 7's changes):
+423 instruments in → **89 passed E1** → 16 reached the regime gate → 9 passed →
+11 reached the entry gate → **2 signals** (PNUT, MOODENG, both long).
 
-Built and tested (292 tests): E1 universe filter · E2 regime gate (stands down
-in chop) · E3 volatility-adjusted momentum ranking · E4 breakout entry with a
-conviction gate at 75 · E5 exits (2×ATR stop, 25% off at +2R, breakeven, 3×ATR
-Chandelier trail tightening to 2.5× past +4R, 12h time stop, 4h cooldown) ·
-sizing with no override path · portfolio heat cap · drawdown governor ·
-kill switch · hash-chained append-only ledger · Trade Kit adapter · copy
-executor · engine loop · driver.
+> **An earlier version of this section said "5 signals" and §5 said "1".** Both
+> were describing E2 survivors, not signals. Recorded because the discrepancy
+> was load-bearing: it made the correlation problem look like a single-cycle
+> event when it is actually a serial one that accumulates over days.
+
+Built and tested (**356 tests**): E1 universe filter (liquidity **and
+affordability**) · E2 regime gate (stands down in chop) · E3 volatility-adjusted
+momentum ranking · E4 breakout entry with a conviction gate at 75 and **funding
+charged into the target** · E5 exits (2×ATR stop, 25% off at +2R, breakeven,
+3×ATR Chandelier trail tightening to 2.5× past +4R, 12h time stop, 4h cooldown,
+**Part X endgame**) · sizing with no override path · portfolio heat cap ·
+**directional cap** · drawdown governor · kill switch · hash-chained append-only
+ledger · Trade Kit adapter · copy executor · engine loop · driver ·
+**entry AND exit signal publication** · **competition start gate**.
 
 **It cannot place a single order, by design.** `execution.maxLeverage` is unset
 and `computeSize()` throws rather than defaulting. It stays that way until the
@@ -55,6 +63,83 @@ and per Law 7, a safety mechanism that has never fired in a test does not exist.
 Still missing on the trading side: E6 pyramiding and E7 fee budget are in config
 but read by no code; daily attribution (Part VIII) is unbuilt; the leaderboard
 parser cannot be written until the page exists on Aug 11.
+
+## 0a. Session 7 — ten defects found by review, and what was done
+
+None of these were in the previous handoff. They were found by reading the code
+against the rules rather than against the build spec, which is why the spec's
+own checklist did not catch them. Ordered as they were ranked: by what costs
+money or eligibility.
+
+**1. Exits were trades, and no exit was published.** `loop.ts` called
+`flatten()` and wrote a ledger row; `publisher` appeared only in the entry path.
+Roughly half of all fills are exits, so half the book had no corresponding
+signal, and a subscriber on auto-copy was told to open and never told to close.
+
+*Fixed, with the ordering deliberately INVERTED from an entry.* An entry
+publishes and trades only if delivery succeeded. An exit **executes first, then
+publishes**, and a publish failure is an alert, never a refusal — gating a close
+on the ASP being reachable would mean a dead publisher leaves us holding a loser
+we are not allowed to cut. There is a test named for it in capitals.
+
+**2. The venue take-profit contradicted E5.** Found while fixing #1. The entry
+order attached a TP at the 3:1 target, but **E5 has no target logic at all** — it
+scales 25% at +2R and trails the rest. The venue would have closed a winner in
+full at 3R, amputating the tail the strategy exists to capture, and the next
+reconcile would have found a phantom position and tripped the kill switch.
+
+*Fixed:* no attached take-profit. The stop stays attached — it is the one order
+that must survive us.
+
+**3. The correlation grouping defeated the heat cap.** Every unlisted symbol got
+its own bucket, so the memecoin complex — where E3's extremes actually live, and
+where nothing is hand-classified — satisfied a cap of two five times over.
+
+*Fixed:* one shared `HIGHBETA_ALT` group, plus a portfolio-wide
+`maxPositionsPerSide: 2`. With 3 slots, the third position must now disagree with
+the first two or not exist. This **reverses** an earlier decision that was right
+in the abstract and wrong at 320 USDT; the reasoning is recorded in the config.
+
+**4. Published leverage had no correct value.** *Fixed, and cheaper than it
+looked:* `notionalUsdt / equity` **is** `sizePercent`. Both are published, and
+`validateSignal` asserts they agree, so a drift between the two formatters is
+caught at the gate. We publish the emergent 0.5–2x, never a nominal 3x.
+
+**5. Nothing stopped the engine trading before Aug 11 12:00.** *Fixed:*
+`competition.startsAt/endsAt` in config, parsed to epoch ms at load with a
+**mandatory timezone offset** — a bare `12:00` would be read as UTC and open the
+engine eight hours early. Refusal lives in the engine AND the copy executor.
+
+**6. Part X endgame had no build task.** *Fixed for the half that needs no
+leaderboard:* T−48h stop new entries, T−24h close losing and flat positions, hold
+winners on a 1.5×ATR trail into the snapshot. The rank-conditional half still
+needs the parser that cannot exist until Aug 11 — but the clock does not wait for
+it, which is the entire point. DeepSeek went +125% → +4.89% without this.
+
+**7. Funding was gated but never paid.** At the old `maxAdverseFundingRate` of
+0.0005 and a 36h hold, an "acceptable" trade paid up to 0.25% of notional against
+a 6% budget spread over ~40 trades — 1.7 trades of budget consumed by one
+position, while the fee tracker reported 2 bps maker and looked healthy.
+
+*Fixed:* threshold lowered to 0.0002 as a backstop, and expected carry is now
+**charged into the target**, so an expensive-to-hold instrument needs a bigger
+move to clear 3:1 rather than clearing it on gross. Visible in the live scan:
+PNUT 0.025%, MOODENG 0.046%.
+
+**8. minSz was never counted. ANSWERED — it is a non-issue.** Measured against
+live OKX: **0 of 423 live USDT perps have a minimum order above $60.** The
+largest inside the universe is UB at $13.20; the median is $0.43. Breadth is
+real. The affordability filter was built anyway and drops nothing today — it is
+a guard against a future listing, not a current constraint. E1 now reports its
+rejections by reason so this question never needs asking twice.
+
+**9. Rule 9 "risk tokens" — STILL OPEN, and it is yours to close.** See §6.
+
+**10. No expectancy evidence.** Not fixable, and not attempted. See §1b.
+
+Everything above is tested. The suite went from 292 to **356**.
+
+---
 
 ## 1. Where things stand in one paragraph
 
@@ -84,6 +169,38 @@ section 6 can be built in parallel; registration cannot be started late. This is
 the one thing that cannot be recovered by working harder later.
 
 ---
+
+## 1b. What the test suite does NOT establish — read before trusting the green
+
+356 tests pass. **None of them establish that the strategy makes money.**
+
+They pin *properties*: that a bar cannot break its own level, that a stop never
+widens, that a touch is not a break, that leverage and size agree, that an exit
+publishes even when the publisher is down. That is the correct thing to test and
+it is worth what it costs. It is not evidence of an edge.
+
+Specifically, and stated plainly so nobody has to infer it:
+
+- **Stage 7's acceptance test has not run.** No 48h paper run, no realised payoff
+  ratio, no measured win rate. `attribution.minRealisedPayoffRatio` is config
+  read by no code — the same status as E6 and E7.
+- **There is no backtest.** Not a weak one; none. The parameters (conviction 75,
+  2×ATR stops, +2R scale-out, 3:1 minimum) come from the spec's reading of Alpha
+  Arena Season 1 results, not from anything measured on this data by this code.
+- **There is not time to fix this before Aug 11**, and attempting it would cost
+  the ASP deadline, which is the one thing that cannot be recovered.
+
+**What is actually carrying the account is the risk architecture** — fixed
+fractional sizing with no override path, the heat cap, the directional cap, the
+drawdown governor, mechanical exits, the kill switch. That is a defensible thing
+to enter a competition on. It is not the same thing as a validated edge, and a
+green suite should never be read as one.
+
+**The cheap thing that helps:** run `scan.ts` hourly for a day and count. Target
+is ~2/day. Three observed runs so far produced 1, 5 (E2 survivors, not signals)
+and 2 signals. If the true rate is 15/day, `minConviction: 75` is too loose and
+we overtrade into fees — the exact failure that killed Gemini and GPT-5. That is
+a one-line config change, and it is much cheaper to make before go-live.
 
 ## 1a. The two documents in `docs/`
 
@@ -154,23 +271,33 @@ each; rule 3.2 requires the service to stay usable **by other subscribers**.
 
 ### Where our build diverged from the spec
 
-10. **`formatSignal` does not match the spec's own canonical shape.** Our defect
-    — the implementation predates reading Part IV.
+10. ~~**`formatSignal` does not match the spec's canonical shape.**~~ **Fixed in
+    session 7**, with three deviations kept deliberately. Current output:
 
-    - Spec: `[Perpetual Signal] SOL-PERP | LONG 3x | Entry 182.4-183.1 | SL 176.8 | TP1 199.2 | Position 8% | Valid for 6h`
-    - Ours: `[Perpetual Signal] LONG BTC-USDT-SWAP entry 64700-64800 stop 64000 target 67200 size 40% id S-...`
+    ```
+    [Perpetual Signal] BTC-USDT-SWAP | LONG 0.4x | Entry 64700-64800 | SL 64000 | TP1 66400 | TP2 67200 | Position 40% | Valid 2026-08-12T13:00Z | S-260812090000-BTC-L
+    ```
 
-    Different delimiters and labels, no leverage, no validity window, an extra
-    id, `-USDT-SWAP` instead of `-PERP`. **Fix `src/signal/publish.ts`.** Two
-    open questions for the planning agent:
+    Decisions made, each cheap to overturn if you disagree:
 
-    - The spec's published-field list has **no signal id**, and Law 6 requires
-      traceability *from logs*. The id could live in the ledger against the
-      delivery `jobId`, freeing ~24 of the 200 characters — but `CopyExecutor`
-      dedupes on the id in the text today, so dedupe would move to the `jobId`.
-    - **Asset naming:** spec and both official examples say `-PERP`; Trade Kit
-      places orders against the instId `-USDT-SWAP`. Ours can map; a third-party
-      subscriber's agent would have to as well.
+    - **`-USDT-SWAP`, not `-PERP`.** It is the instId Trade Kit places against,
+      and Law 6 is that published equals placed. A subscriber maps one name;
+      publishing an instrument we do not trade inverts the law. *(The ASP
+      classifier reads name/title/description, not the signal body, so the
+      mandatory `Perpetual` keyword is unaffected either way.)*
+    - **The signal id stays in the text.** The spec's field list omits it, but
+      Law 6 requires traceability *from logs*, and the alternative — keying on
+      the delivery `jobId` — cannot be built until the publisher exists. 24
+      characters is cheap for traceability that does not depend on an unbuilt
+      component. Revisit once the publisher is real.
+    - **Absolute expiry, not "Valid for 6h".** A duration means one thing to the
+      publisher and another to a reader forty minutes later. Same reasoning as
+      absolute prices.
+
+    And one addition the spec does not have: **TP1 and TP2 are different
+    events.** TP1 is where 25% actually comes off at +2R; TP2 is the screening
+    target the trail may or may not reach. Publishing one number and calling it
+    the plan is what made the old signal describe a trade we never took.
 
 11. **The build order was not followed.** Part XIII puts the ASP at stage 2,
     *before* the Trade Kit adapter at stage 3, precisely because of the deadline.
@@ -569,14 +696,33 @@ It is stateless, so it passes no cooldown. The live engine must.
    the daemon classifies the service as `text`, which delivers successfully and
    executes nothing.
 
-4. **Optional but recommended — a demo API key.**
+4. **Ask OKX what "risk tokens" means (rule 9).** One message, and it is the
+   highest expected value per minute left in the project.
+
+   The rule says only *"risk tokens are excluded from the PnL% calculation"* and
+   **never defines the term** — it is an unknown, not a stated exclusion of
+   anything in particular. The build spec dismissed it (*"trading only liquid
+   USDT perps sidesteps this entirely"*), which is an assertion in a document
+   whose Law 1 is "verify, never assume".
+
+   It matters because our live signals keep being memecoins: BOME, NEIRO, PNUT,
+   MOODENG. **Bounded downside**, though — rule 9 excludes them from PnL% only,
+   and ranking is 50% PnL% + 50% PnL (rule 6), so the worst case costs half the
+   score, not all of it.
+
+   If the answer is "yes, low-cap memes count", the response is a config change,
+   not a code change: extend `universe.excludeSymbols`, or raise
+   `minQuoteVolume24hUsdt` until the tail drops out. Do **not** build a
+   classifier we cannot validate against their definition.
+
+5. **Optional but recommended — a demo API key.**
    OKX → Demo trading → API key (Read + Trade, Perpetual). Then on the box:
    `okx config init`, answer `1`, **`Y`** to demo, profile name `okx-demo`.
    Without it the stop kill test must run on live money.
 
 ### Blocked on funding (not on time)
 
-5. **Part IX stop verification — the gate on everything.**
+6. **Part IX stop verification — the gate on everything.**
    Open a minimum-size position, attach a stop, `kill -9` the agent, inspect
    from the venue side whether the stop still rests, reboot the box, inspect
    again. Result decides:
@@ -616,14 +762,20 @@ from every angle except the rules. It cannot be written until the ASP is
 registered and its delivery contract is observable, which makes registration the
 blocker for code as well as for eligibility.
 
+~~Exit publication, competition clock, directional cap, funding cost, Part X
+endgame, E1 affordability.~~ **Done in session 7** — see §0a. 356 tests.
+
 Then 10 and 11.
 
 10. **Server hardening** — systemd units with `MemoryMax`, ufw, NTP, alerts,
     pending reboot (`libc6` + kernel update outstanding).
-11. **Leaderboard parser** — Aug 11 only, against the real page.
-12. ~~**Wire the engine loop**~~ — done. What is still missing around it:
-
-    All done except the publisher, which is item 13.
+11. **Leaderboard parser** — Aug 11 only, against the real page. Now also
+    unlocks the **rank-conditional half of Part X**: the time-conditional half
+    is built and runs unconditionally, but "de-risk when leading with cushion,
+    concentrate when mid-table because 6th and 20th pay identically" needs a
+    live rank. Wire it into `competitionPhase` consumers once the parser exists.
+12. **Hourly `scan.ts` frequency count** — cheap, and it is the only evidence
+    available before go-live that `minConviction: 75` is set correctly. See §1b.
 
 
 ## 7. Traps already identified — do not rediscover these the hard way
@@ -655,6 +807,27 @@ Then 10 and 11.
 - **The reference delivery daemon exits zero on JWT expiry**, so
   `Restart=always` may not restart it. Exit non-zero, write a liveness file,
   and monitor off-box.
+- **A competition timestamp without a timezone offset is eight hours wrong.**
+  The schema rejects one, and it must keep doing so. `2026-08-11T12:00:00` reads
+  as UTC and opens the engine at 20:00 UTC+8 the day *before* — pre-start fills
+  that move equity and do not score.
+- **Do NOT make exit publication a precondition for closing.** It is the mirror
+  of the entry rule and it looks like an inconsistency worth tidying up. It is
+  not: an entry that cannot be published is simply not taken, while an exit that
+  cannot be published has already happened, and refusing to close because the
+  ASP is unreachable trades unbounded risk for a record. There is a test in
+  capitals guarding this.
+- **Do NOT re-attach a venue take-profit.** `targetPrice: null` in the copy
+  executor is deliberate. E5 owns exits; a venue TP closes the whole position at
+  TP2, amputates the tail, and leaves the engine trailing a stop on a position
+  that no longer exists until reconcile trips the kill switch.
+- **`maxPositionsPerSide` must stay strictly below `maxConcurrentPositions`.**
+  The schema enforces it. Equal values permit a fully one-sided book, which is
+  the concentration the cap exists to prevent.
+- **`regime.fundingWindowHours` is the one assumed number in `config/default.yaml`.**
+  Every other value there is policy or measured; this is a venue fact sitting in
+  a policy file, unverified. It is 8 for every OKX USDT perp today. Move it to
+  the runtime profile when the profile learns to carry it.
 
 ---
 

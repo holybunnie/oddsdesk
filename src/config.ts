@@ -33,8 +33,58 @@ const drawdownBandSchema = z
 
 const stageKeyed = <T extends z.ZodTypeAny>(inner: T) => z.object({ 1: inner, 2: inner, 3: inner }).strict();
 
+/**
+ * An ISO-8601 instant with an explicit offset, parsed to epoch ms at load.
+ *
+ * The offset is mandatory. The competition is specified in UTC+8 and the box
+ * runs UTC, so a bare "2026-08-11T12:00:00" would be read as UTC and open the
+ * engine eight hours early — a pre-start fill that does not score and cannot be
+ * undone. Requiring the offset makes that class of mistake unrepresentable.
+ */
+const instant = z
+  .string()
+  .regex(
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})$/,
+    'must be an ISO-8601 instant with an explicit timezone offset, e.g. 2026-08-11T12:00:00+08:00',
+  )
+  .transform((text, ctx) => {
+    const ms = Date.parse(text);
+    if (Number.isNaN(ms)) {
+      ctx.addIssue({ code: 'custom', message: `${text} is not a parseable instant` });
+      return z.NEVER;
+    }
+    return ms;
+  });
+
 export const configSchema = z
   .object({
+    /**
+     * The competition clock, transcribed from the event page rather than chosen.
+     *
+     * Both ends do work. `startsAt` is a refusal — no position may be opened
+     * before it, because a pre-start fill moves equity, does not score, and
+     * cannot be reversed. `endsAt` anchors the Part X endgame, every phase of
+     * which is measured backwards from the final snapshot.
+     */
+    competition: z
+      .object({
+        startsAt: instant,
+        endsAt: instant,
+        endgame: z
+          .object({
+            noNewEntriesHoursBeforeEnd: positive,
+            closeLosersHoursBeforeEnd: positive,
+            chandelierAtrMultiple: positive,
+          })
+          .strict()
+          .refine(
+            (e) => e.closeLosersHoursBeforeEnd < e.noNewEntriesHoursBeforeEnd,
+            'the endgame narrows: entries stop before losers are closed, not after',
+          ),
+      })
+      .strict()
+      .refine((c) => c.startsAt < c.endsAt, 'the competition must end after it starts'),
+
     capital: z
       .object({
         principalBaseUsdt: positive,
@@ -52,6 +102,16 @@ export const configSchema = z
         maxPortfolioHeat: fraction,
         maxConcurrentPositions: z.number().int().positive(),
         maxPositionsPerCorrelationGroup: z.number().int().positive(),
+        /**
+         * Portfolio-wide cap on positions facing the same way.
+         *
+         * The correlation groups encode relationships we anticipated. This
+         * catches the ones we did not: E3 selects momentum extremes, and in
+         * crypto the extremes are usually one complex moving together, so a
+         * book that looks diversified by group can still be a single directional
+         * bet placed three times.
+         */
+        maxPositionsPerSide: z.number().int().positive(),
         drawdownGovernor: stageKeyed(drawdownBandSchema),
         haltDurationHours: positive,
         stage2EquityMultiple: z.number().gt(1),
@@ -64,6 +124,11 @@ export const configSchema = z
       .refine(
         (r) => r.maxPositionsPerCorrelationGroup <= r.maxConcurrentPositions,
         'maxPositionsPerCorrelationGroup cannot exceed maxConcurrentPositions',
+      )
+      .refine(
+        (r) => r.maxPositionsPerSide < r.maxConcurrentPositions,
+        'maxPositionsPerSide must be BELOW maxConcurrentPositions — a cap equal to the ' +
+          'position limit permits a fully one-sided book, which is the concentration it exists to prevent',
       ),
 
     execution: z
@@ -84,6 +149,16 @@ export const configSchema = z
         minQuoteVolume24hUsdt: positive,
         maxSpreadBps: positive,
         excludeSymbols: z.array(z.string().min(1)),
+        /**
+         * Smallest notional the engine expects to place. An instrument whose
+         * minimum order exceeds it is dropped from the universe.
+         *
+         * Without this, an unaffordable instrument counts as breadth in the
+         * scan and produces a venue rejection in the book — and because the
+         * signal is journalled before submission, that rejection is never
+         * retried. It is a candidate that can never become a position.
+         */
+        minTradableNotionalUsdt: positive,
       })
       .strict(),
 
@@ -105,6 +180,16 @@ export const configSchema = z
         volumeWindow: z.number().int().positive(),
         minVolumeTrend: positive,
         maxAdverseFundingRate: positive,
+        /**
+         * Whether expected funding is charged against the payoff test.
+         *
+         * A filter asks whether a rate is tolerable; charging asks whether the
+         * trade still clears the minimum payoff ratio after carry. Configurable
+         * so the behaviour can be turned off deliberately and visibly, never by
+         * a value quietly going missing.
+         */
+        fundingCharged: z.boolean(),
+        fundingWindowHours: positive,
       })
       .strict()
       .refine((r) => r.minRealizedVol < r.maxRealizedVol, 'the volatility band must be non-empty'),
@@ -120,13 +205,19 @@ export const configSchema = z
     correlationGroups: z.record(z.string().min(1), z.array(z.string().min(1)).min(1)),
 
     /**
-     * Prefix for a base symbol named in no list, e.g. `ungrouped:FARTCOIN`.
+     * The single group every unclassified base symbol falls into.
      *
-     * A PREFIX, not a group name. A single shared "other" bucket would make two
-     * unrelated small caps count as a correlated pair and refuse a trade we
-     * cannot justify refusing.
+     * A GROUP NAME, not a prefix. The prefix it replaces gave each unlisted
+     * symbol a private bucket, which made `maxPositionsPerCorrelationGroup`
+     * unenforceable exactly where enforcement matters — the unclassified tail is
+     * where the correlated memecoin complex lives, and a live scan produced five
+     * of them in one pass, each satisfying the cap alone.
+     *
+     * Renamed rather than redefined, so a config still carrying `ungroupedPrefix`
+     * fails to load instead of silently keeping the old behaviour under a key
+     * that now means something else.
      */
-    ungroupedPrefix: z.string().min(1),
+    ungroupedGroup: z.string().min(1),
 
     ranking: z
       .object({
@@ -217,6 +308,14 @@ export const configSchema = z
         maxSignalChars: z.number().int().positive(),
         perpHeader: z.string().min(1),
         requireSignalCorrespondence: z.boolean(),
+        /**
+         * Whether exit actions are published as signals of their own.
+         *
+         * Half of all fills are exits. With this off, half the book has no
+         * corresponding published signal and a subscriber is told to open and
+         * never told to close.
+         */
+        publishExits: z.boolean(),
       })
       .strict(),
   })
@@ -296,6 +395,46 @@ export function assertIsolatedMargin(config: Config): void {
         'Cross margin lets one position consume the equity backing every other.',
     );
   }
+}
+
+/**
+ * Where we are on the competition clock.
+ *
+ * One vocabulary shared by the start gate and the Part X endgame, so the two
+ * cannot disagree about what phase it is. Ordered by how much they restrict:
+ *
+ *   before      — registration window. No position may be opened at all.
+ *   open        — normal trading.
+ *   noNewEntries — T-48h. Manage what we hold; start nothing new.
+ *   closeLosers — T-24h. Losing and flat positions go; winners trail tight.
+ *   after       — the snapshot has been taken. Nothing we do now scores.
+ */
+export type CompetitionPhase = 'before' | 'open' | 'noNewEntries' | 'closeLosers' | 'after';
+
+/**
+ * The phase at a given instant.
+ *
+ * Pure and total: every instant maps to exactly one phase, so there is no
+ * "unknown" state a caller could interpret as permission. Callers pass the clock
+ * in rather than reading it here — the engine has one `now` per cycle, and two
+ * gates disagreeing about the time by a few milliseconds at a boundary is the
+ * kind of fault that appears once, at the worst moment, and never reproduces.
+ */
+export function competitionPhase(config: Config, nowMs: number): CompetitionPhase {
+  const { startsAt, endsAt, endgame } = config.competition;
+
+  if (nowMs < startsAt) return 'before';
+  if (nowMs >= endsAt) return 'after';
+
+  const msLeft = endsAt - nowMs;
+  if (msLeft <= endgame.closeLosersHoursBeforeEnd * 3_600_000) return 'closeLosers';
+  if (msLeft <= endgame.noNewEntriesHoursBeforeEnd * 3_600_000) return 'noNewEntries';
+  return 'open';
+}
+
+/** Whether a NEW position may be opened right now. Only one phase permits it. */
+export function entriesPermitted(phase: CompetitionPhase): boolean {
+  return phase === 'open';
 }
 
 export function riskFractionForStage(config: Config, stage: Stage): number {

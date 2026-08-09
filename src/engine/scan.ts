@@ -29,8 +29,9 @@ import {
   assessRegime,
   rankByMomentum,
   regimeIsFavourable,
-  selectUniverse,
+  selectUniverseWithRejections,
   takeExtremes,
+  type UniverseRejection,
   type Direction,
   type RankedInstrument,
   type RegimeVerdict,
@@ -73,6 +74,17 @@ export interface ScanDiagnostics {
   readonly rejected: readonly RejectedCandidate[];
   readonly regimePassing: number;
   readonly regimeConsidered: number;
+  /**
+   * Why each instrument failed E1.
+   *
+   * Reported because the reasons are not interchangeable. An instrument dropped
+   * for volume can be recovered by loosening a threshold; one dropped for
+   * minimum size cannot be recovered at all at this account size, and the count
+   * of those is the honest measure of how much of the venue we can actually
+   * reach. Breadth is the strategy's central assumption and this is the only
+   * number that tests it.
+   */
+  readonly universeRejections: readonly UniverseRejection[];
 }
 
 export interface ScanOptions {
@@ -99,7 +111,7 @@ export async function runScan(options: ScanOptions): Promise<ScanDiagnostics> {
     (i) => i.instId.endsWith('-USDT-SWAP') && i.state === 'live',
   ).length;
 
-  const universe = selectUniverse(config, instruments, tickers);
+  const { members: universe, rejections } = selectUniverseWithRejections(config, instruments, tickers);
 
   // Open positions join the fetch list even when E1 rejected them. A position
   // whose instrument lost liquidity still has to be managed to the exit.
@@ -200,6 +212,10 @@ export async function runScan(options: ScanOptions): Promise<ScanDiagnostics> {
           }
           const candles4h = confirmedOnly(await market.candles(item.ranked.instId, '4H', HTF_CANDLE_LIMIT));
           const cooldownUntilMs = cooldowns.get(item.ranked.instId);
+          const fundingRate = fundingByInstrument.get(item.ranked.instId);
+          if (fundingRate === undefined) {
+            throw new ScanPipelineError(`no funding rate for ${item.ranked.instId} — cannot price carry`);
+          }
 
           const verdict = evaluateEntry(config, {
             ranked: item.ranked,
@@ -209,6 +225,7 @@ export async function runScan(options: ScanOptions): Promise<ScanDiagnostics> {
             volumeTrendValue: item.verdict.volumeTrend,
             universeSize: ranked.length,
             rankIndex: item.rankIndex,
+            fundingRate,
             nowMs,
             ...(cooldownUntilMs === undefined ? {} : { cooldownUntilMs }),
           });
@@ -229,5 +246,6 @@ export async function runScan(options: ScanOptions): Promise<ScanDiagnostics> {
     rejected,
     regimePassing,
     regimeConsidered: verdicts.length,
+    universeRejections: rejections,
   };
 }

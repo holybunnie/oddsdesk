@@ -25,7 +25,7 @@
  * all rather than sizing off an unverified stop mechanism.
  */
 
-import { requireMaxLeverage, type Config } from '../config.js';
+import { competitionPhase, entriesPermitted, requireMaxLeverage, type Config } from '../config.js';
 import { assertAboveEligibilityFloor } from '../risk.js';
 import {
   formatPrice,
@@ -55,11 +55,15 @@ export interface ParsedSignal {
   readonly signalId: string;
   readonly instId: string;
   readonly direction: Direction;
+  readonly leverage: number;
   readonly entryLow: number;
   readonly entryHigh: number;
   readonly stopPrice: number;
+  readonly scaleOutPrice: number;
   readonly targetPrice: number;
   readonly sizePercent: number;
+  /** Absolute expiry, read from the text rather than inferred from delivery. */
+  readonly validUntilMs: number;
 }
 
 /**
@@ -69,9 +73,9 @@ export interface ParsedSignal {
  * make impossible.
  */
 const SIGNAL_PATTERN =
-  /^(LONG|SHORT) (\S+) entry (\d+(?:\.\d+)?)-(\d+(?:\.\d+)?) stop (\d+(?:\.\d+)?) target (\d+(?:\.\d+)?) size (\d+(?:\.\d+)?)% id (\S+)$/;
+  /^(\S+) \| (LONG|SHORT) (\d+(?:\.\d+)?)x \| Entry (\d+(?:\.\d+)?)-(\d+(?:\.\d+)?) \| SL (\d+(?:\.\d+)?) \| TP1 (\d+(?:\.\d+)?) \| TP2 (\d+(?:\.\d+)?) \| Position (\d+(?:\.\d+)?)% \| Valid (\S+) \| (\S+)$/;
 
-/** Parse a published signal. Throws rather than returning a partial reading. */
+/** Parse a published entry signal. Throws rather than returning a partial reading. */
 export function parseSignal(config: Config, text: string): ParsedSignal {
   const header = config.publishing.perpHeader;
   if (!text.startsWith(header)) {
@@ -86,18 +90,100 @@ export function parseSignal(config: Config, text: string): ParsedSignal {
     throw new CopyExecutorError(`signal body does not match the published format: ${JSON.stringify(body)}`);
   }
 
-  const [, side, instId, entryLow, entryHigh, stopPrice, targetPrice, sizePercent, signalId] = match as unknown as
-    readonly string[];
+  const [
+    ,
+    instId,
+    side,
+    leverage,
+    entryLow,
+    entryHigh,
+    stopPrice,
+    scaleOutPrice,
+    targetPrice,
+    sizePercent,
+    validUntil,
+    signalId,
+  ] = match as unknown as readonly string[];
 
-  return {
+  const validUntilMs = Date.parse(validUntil as string);
+  if (Number.isNaN(validUntilMs)) {
+    throw new CopyExecutorError(`signal validity ${JSON.stringify(validUntil)} is not a parseable instant`);
+  }
+
+  const parsed: ParsedSignal = {
     signalId: signalId as string,
     instId: instId as string,
     direction: side === 'LONG' ? 'long' : 'short',
+    leverage: Number(leverage),
     entryLow: Number(entryLow),
     entryHigh: Number(entryHigh),
     stopPrice: Number(stopPrice),
+    scaleOutPrice: Number(scaleOutPrice),
     targetPrice: Number(targetPrice),
     sizePercent: Number(sizePercent),
+    validUntilMs,
+  };
+
+  // Leverage and size are the same quantity published twice. They agreed when
+  // the signal was built; if they disagree now, the text was altered in transit
+  // or the two formatters have drifted. Either way the numbers cannot both be
+  // trusted, and this executor's whole purpose is to refuse rather than pick one.
+  const implied = Number((parsed.sizePercent / 100).toFixed(2));
+  if (parsed.leverage !== implied) {
+    throw new CopyExecutorError(
+      `signal states ${parsed.leverage}x but a position of ${parsed.sizePercent}% implies ${implied}x — ` +
+        'the published leverage and size disagree',
+    );
+  }
+
+  return parsed;
+}
+
+/** A published exit action, parsed back. The inverse of `formatExitSignal`. */
+export interface ParsedExitSignal {
+  readonly exitId: string;
+  readonly refSignalId: string;
+  readonly instId: string;
+  readonly direction: Direction;
+  readonly action: { readonly kind: 'close'; readonly percent: number } | { readonly kind: 'stop'; readonly to: number };
+  readonly price: number;
+}
+
+const EXIT_PATTERN =
+  /^(\S+) \| EXIT (LONG|SHORT) \| (?:CLOSE (\d+(?:\.\d+)?)%|SL (\d+(?:\.\d+)?)) \| @(\d+(?:\.\d+)?) \| ref (\S+) \| (\S+)$/;
+
+/**
+ * Parse a published exit signal.
+ *
+ * We never act on these ourselves — our own exits are executed directly, and the
+ * published text is the record of what already happened. It exists so the round
+ * trip is pinned by a test and so a subscriber's agent has a defined grammar to
+ * implement against. A format we publish but cannot read back is a format we
+ * have no evidence anyone else can read either.
+ */
+export function parseExitSignal(config: Config, text: string): ParsedExitSignal {
+  const header = config.publishing.perpHeader;
+  if (!text.startsWith(header)) {
+    throw new CopyExecutorError(`exit signal does not begin with the header ${JSON.stringify(header)}`);
+  }
+
+  const match = EXIT_PATTERN.exec(text.slice(header.length).trim());
+  if (match === null) {
+    throw new CopyExecutorError(`exit signal does not match the published format: ${JSON.stringify(text)}`);
+  }
+
+  const [, instId, side, closePercent, stopTo, price, refSignalId, exitId] = match as unknown as readonly string[];
+
+  return {
+    exitId: exitId as string,
+    refSignalId: refSignalId as string,
+    instId: instId as string,
+    direction: side === 'LONG' ? 'long' : 'short',
+    action:
+      closePercent === undefined
+        ? { kind: 'stop', to: Number(stopTo) }
+        : { kind: 'close', percent: Number(closePercent) },
+    price: Number(price),
   };
 }
 
@@ -226,6 +312,31 @@ export class CopyExecutor {
     // payoff checks do not, and those are the ones that matter: this is what
     // makes an altered or wrongly-published signal refused at the executor
     // rather than traded on trust.
+    const nowMs = this.#now();
+
+    // The competition window, checked here as well as in the engine. The engine
+    // is the only component that decides to open a position, so its gate is the
+    // one that matters — but this is the last refusal before the venue, and a
+    // pre-start fill moves equity, does not score, and cannot be undone. The
+    // same reasoning that puts `requireMaxLeverage` in two places puts this here.
+    const phase = competitionPhase(this.#config, nowMs);
+    if (!entriesPermitted(phase)) {
+      return refuse(`competition phase is "${phase}" — no new position may be opened`);
+    }
+
+    // The published expiry is authoritative: it is what a subscriber reading the
+    // signal would honour, and honouring something else would make our fills
+    // diverge from our own published instruction. `maxSignalAgeMs` remains as a
+    // second bound on how long a delivery may sit before it is acted on.
+    if (nowMs >= parsed.validUntilMs) {
+      return refuse(`signal expired at ${new Date(parsed.validUntilMs).toISOString()}`);
+    }
+    if (nowMs - deliveredAtMs > this.#maxSignalAgeMs) {
+      return refuse(
+        `signal was delivered ${((nowMs - deliveredAtMs) / 60_000).toFixed(1)} minutes ago, over the limit`,
+      );
+    }
+
     const plan: SignalPlan = {
       signalId: parsed.signalId,
       instId: parsed.instId,
@@ -233,13 +344,14 @@ export class CopyExecutor {
       entryLow: parsed.entryLow,
       entryHigh: parsed.entryHigh,
       stopPrice: parsed.stopPrice,
+      scaleOutPrice: parsed.scaleOutPrice,
       targetPrice: parsed.targetPrice,
       sizePercent: parsed.sizePercent,
-      validUntilMs: deliveredAtMs + this.#maxSignalAgeMs,
+      validUntilMs: parsed.validUntilMs,
     };
     const context: ValidationContext = {
       liveInstruments: new Set(this.#instruments.keys()),
-      nowMs: this.#now(),
+      nowMs,
     };
     const validation = validateSignal(this.#config, text, plan, context);
     if (!validation.ok) {
@@ -301,7 +413,17 @@ export class CopyExecutor {
       limitPrice: priceToMinor(limitPrice, instrument.priceDecimals),
       size,
       stopPrice: priceToMinor(parsed.stopPrice, instrument.priceDecimals),
-      targetPrice: priceToMinor(parsed.targetPrice, instrument.priceDecimals),
+      // NO ATTACHED TAKE-PROFIT, deliberately.
+      //
+      // E5 has no target logic: it takes 25% off at +2R, moves to breakeven and
+      // trails the remainder. A venue take-profit at TP2 would close the whole
+      // position the moment price touched 3R — amputating the tail the strategy
+      // exists to capture, and, worse, leaving the engine trailing a stop on a
+      // position that no longer exists until the next reconcile found the
+      // divergence and tripped the kill switch.
+      //
+      // The stop stays attached. It is the one order that must survive us.
+      targetPrice: null,
       reason: parsed.signalId,
       clientOrderId: clientOrderIdFor(parsed.signalId),
     };

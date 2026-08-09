@@ -20,7 +20,7 @@
 
 import { readFileSync } from 'node:fs';
 import { parse as parseYaml } from 'yaml';
-import { loadConfig } from '../config.js';
+import { competitionPhase, entriesPermitted, loadConfig } from '../config.js';
 import { Ledger } from '../ledger.js';
 import { KillSwitch } from '../kill-switch.js';
 import { OkxMarketData } from '../market/okx.js';
@@ -134,6 +134,19 @@ async function main(): Promise<void> {
     positionMode,
   });
 
+  // Stated at startup rather than discovered at the first refusal. Running the
+  // engine before the competition opens is a legitimate thing to do — it is how
+  // the dry run works — but it must never be a surprise that nothing traded.
+  const phase = competitionPhase(config, Date.now());
+  console.log(
+    `competition phase: ${phase} ` +
+      `(opens ${new Date(config.competition.startsAt).toISOString()}, ` +
+      `closes ${new Date(config.competition.endsAt).toISOString()})`,
+  );
+  if (!entriesPermitted(phase)) {
+    console.log('  no new position will be opened in this phase. Exits are still managed.');
+  }
+
   console.log(`stop custody: ${stopCustody}`);
   if (stopCustody === 'unverified') {
     console.log('  submitOrder will refuse. Run the Part IX kill test before expecting a fill.');
@@ -185,7 +198,7 @@ async function main(): Promise<void> {
     intervalSeconds: config.risk.reconcileIntervalSeconds,
     onCycle: (report) => {
       console.log(
-        `[cycle] stage ${report.stage} governor ${report.governor} ` +
+        `[cycle] phase ${report.phase} stage ${report.stage} governor ${report.governor} ` +
           `equity ${report.equityUsdt.toFixed(2)} peak ${report.peakEquityUsdt.toFixed(2)} ` +
           `exits ${report.exits.length} signals ${JSON.stringify(report.signals)}` +
           (report.standDownReason === null ? '' : ` — ${report.standDownReason}`),

@@ -11,6 +11,38 @@
 # Every value below is loaded at runtime. Changing a threshold is a YAML edit,
 # never a rebuild.
 
+# The competition clock. POLICY only in the sense that we transcribe it; the
+# times themselves come from the event page (rule 1) and are not ours to choose.
+#
+# The engine refuses to open a position outside [startsAt, endsAt]. A fill before
+# the start does not score, cannot be undone, and moves equity — and the Part X
+# endgame is measured backwards from `endsAt`, so both ends are load-bearing.
+competition:
+  startsAt: "2026-08-11T12:00:00+08:00"
+  endsAt: "2026-08-25T12:00:00+08:00"
+
+  # PART X — the endgame, measured back from endsAt.
+  #
+  # Unrealised PnL counts at the final snapshot, so an open position at the close
+  # is a live bet on the prize. DeepSeek went +125% -> +4.89% for want of this.
+  #
+  # These are the TIME-conditional half of Part X and they run unconditionally.
+  # The rank-conditional half (step 1, "rank steering confirms a prize band")
+  # needs a leaderboard parser that cannot exist until the page does on Aug 11.
+  # An endgame that fires on the clock is worth far more than one that waits for
+  # a parser, so the clock does not depend on the rank.
+  endgame:
+    # Stop opening new positions. A trade opened here cannot reach its 36h max
+    # hold before the snapshot, so it is a coinflip resolved by the clock.
+    noNewEntriesHoursBeforeEnd: 48
+    # Close losing and flat positions. They are not going to come back inside a
+    # day, and a loser carried into the snapshot is a realised loss taken late.
+    closeLosersHoursBeforeEnd: 24
+    # Winners are held into the snapshot on a tightened trail: the trail converts
+    # a coinflip into a floor. Tighter than the tightened trail (2.5x) because
+    # there is no longer any tail left to pay for the room.
+    chandelierAtrMultiple: 1.5
+
 capital:
   # Principal Base locks at registration and is the PnL% denominator for the
   # whole competition. It never changes. Depositing permanently damages half the
@@ -36,6 +68,17 @@ risk:
   maxPortfolioHeat: 0.06
   maxConcurrentPositions: 3
   maxPositionsPerCorrelationGroup: 2
+
+  # Portfolio-wide directional cap. The correlation groups below catch instruments
+  # we KNEW to be related; this catches the ones we did not.
+  #
+  # E3 takes momentum extremes, and in crypto the extremes are almost always the
+  # same complex moving together — a live scan on 2026-08-09 produced BOME,
+  # PEOPLE, PARTI, NEIRO and ESP, all long, none of them in any group below. With
+  # 3 slots, a cap of 2 means the third position must disagree with the first two
+  # or not exist. That is the difference between a portfolio and a single bet
+  # placed three times.
+  maxPositionsPerSide: 2
 
   # Drawdown governor, measured from PEAK equity, stage-aware.
   drawdownGovernor:
@@ -85,6 +128,20 @@ universe:
   # string that the schema then rejects.
   minQuoteVolume24hUsdt: 20000000
   maxSpreadBps: 5
+
+  # E1 must also reject instruments we cannot afford one unit of.
+  #
+  # An instrument whose minimum order is larger than the notional we would place
+  # is not in the universe — it is a rejection waiting to happen, and because the
+  # signal is journalled before submission, that rejection is never retried. It
+  # would look like breadth in the scan and produce nothing in the book.
+  #
+  # The floor is the SMALLEST notional the engine expects to place. Notional is
+  # riskUsdt / stopFraction, so at stage 1 (2% of 320 = 6.4 USDT) a wide 10% ATR
+  # stop gives 64 USDT and a tight 4% stop gives 160. 60 is the conservative end
+  # of that range: an instrument we cannot trade on our widest stop is one we
+  # would only ever reach by luck of volatility.
+  minTradableNotionalUsdt: 60
   # Tokenised equities and commodities trade on the venue as perps but gap
   # across traditional market hours and weekends, which breaks the ATR and
   # breakout logic. Excluded by explicit symbol list, refreshed when the venue
@@ -144,7 +201,33 @@ regime:
   minVolumeTrend: 1.0
   # Funding working against the intended direction is both a carrying cost and
   # a crowding signal. Expressed per funding interval, as a fraction.
-  maxAdverseFundingRate: 0.0005
+  #
+  # Lowered from 0.0005. That threshold was set as a CROWDING filter and read as
+  # though it were free. It is not: funding is paid every 8 hours, the hold band
+  # is 4-36h, so an at-threshold trade pays up to 5 windows. At 0.0005 that is
+  # 0.25% of notional on one trade, against a 6% total fee budget spread over
+  # ~40 trades — 0.15% each. One "acceptable" funding rate consumed 1.7 trades of
+  # budget while the fee tracker reported 2 bps maker and looked healthy.
+  #
+  # The threshold is now a backstop rather than the control. The control is
+  # `fundingCharged` below, which makes the cost change the trade instead of
+  # merely vetoing it.
+  maxAdverseFundingRate: 0.0002
+
+  # Charge expected funding against the payoff test.
+  #
+  # A filter answers "is this rate tolerable". Charging answers the question that
+  # matters: does this trade still clear 3:1 AFTER carry. Below, the expected
+  # cost is pushed into the target, so a trade with expensive funding needs a
+  # bigger move to qualify — and one that cannot offer it is simply not a signal.
+  fundingCharged: true
+  # Hours per funding window. Strictly a VENUE FACT, sitting here against the
+  # rule at the top of this file, and the exception is deliberate: it is 8 for
+  # every OKX USDT perp and the alternative is a cost model that cannot be
+  # evaluated until the runtime profile loads. Move it to the profile when the
+  # profile learns to carry it — it is NOT verified today, which makes it the
+  # one number in this file that is assumed rather than measured.
+  fundingWindowHours: 8
 
 # Correlation groups. POLICY: our judgement about what moves together, not a
 # venue fact. maxPositionsPerCorrelationGroup does nothing without this — perps
@@ -196,11 +279,19 @@ correlationGroups:
     - FLOKI
     - TRUMP
 
-# Prefix, not a group name: an unlisted symbol becomes "ungrouped:FARTCOIN" and so
-# gets its own bucket. Pooling everything unlisted into one "other" group would
-# make two unrelated small caps count as a correlated pair, which is a refusal
-# we could not justify.
-ungroupedPrefix: ungrouped
+# A GROUP NAME, not a prefix: every symbol named in no list above lands in this
+# one shared bucket and counts against maxPositionsPerCorrelationGroup together.
+#
+# This reverses an earlier decision, and the reversal is the point. Giving each
+# unlisted symbol its own bucket was defended on the grounds that two unrelated
+# small caps should not count as a correlated pair. True in general, and wrong at
+# this size: with 3 slots and 320 USDT, a false refusal costs one trade, while
+# the concentration it permits costs the account. The 2026-08-09 scan is the
+# evidence — five unlisted memecoins, five private buckets, cap satisfied.
+#
+# The name says what it is. Anything the venue lists that we have not classified
+# is, in practice, a high-beta alt.
+ungroupedGroup: HIGHBETA_ALT
 
 ranking:
   # E3. Momentum normalised by ATR so a 3% BTC move and a 12% alt move are
@@ -297,3 +388,17 @@ publishing:
   # Law 6: every trade originates from a published signal. The executor may act
   # only on signals that were actually delivered.
   requireSignalCorrespondence: true
+
+  # EXITS ARE TRADES. Every scale-out, breakeven move, ratchet, time stop and
+  # close is a fill OKX will compare against our published signals, and roughly
+  # half of all fills are exits. Publishing entries only means half the book has
+  # no corresponding signal — and a subscriber on auto-copy is told to open and
+  # never told to close.
+  #
+  # The ordering is deliberately the INVERSE of an entry. An entry publishes and
+  # then trades, so an undelivered signal is never traded. An exit trades and
+  # then publishes, because gating a close on the ASP being reachable would mean
+  # a dead publisher leaves us holding a losing position we are not allowed to
+  # exit. An unpublished entry is a rule breach we chose to commit; an
+  # unpublished exit is one the venue committed to us while we held risk.
+  publishExits: true

@@ -16,7 +16,7 @@
  * makes it exhaustively testable without a venue.
  */
 
-import type { Config } from '../config.js';
+import type { CompetitionPhase, Config } from '../config.js';
 
 export type Side = 'long' | 'short';
 
@@ -161,7 +161,19 @@ export function initialStopFor(config: Config, side: Side, entryPrice: number, a
  * time stop fires. There is deliberately no path that widens a stop, averages
  * down, or grants a losing trade more time.
  */
-export function evaluateExit(config: Config, position: PositionState, market: MarketState): ExitPlan {
+export function evaluateExit(
+  config: Config,
+  position: PositionState,
+  market: MarketState,
+  /**
+   * Where we are on the competition clock (Part X).
+   *
+   * Defaulted to `open` so the exit rules are still a pure function of the trade
+   * for every caller that has no competition context — a backtest, a test, the
+   * observability script. The engine always passes the real phase.
+   */
+  phase: CompetitionPhase = 'open',
+): ExitPlan {
   const { exits } = config;
   const r = rMultiple(position, market.lastPrice);
   const actions: ExitAction[] = [];
@@ -177,6 +189,34 @@ export function evaluateExit(config: Config, position: PositionState, market: Ma
         {
           kind: 'close_full',
           reason: `stop hit at ${market.lastPrice} (stop ${position.currentStop}, ${r.toFixed(2)}R)`,
+          cooldownUntilMs,
+        },
+      ],
+    };
+  }
+
+  // 1b. PART X — the endgame. Unrealised PnL counts at the final snapshot, so an
+  //     open position at the close is a live bet on the prize.
+  //
+  //     Placed immediately after the stop and before everything else because it
+  //     is a decision about the COMPETITION rather than about the trade: at
+  //     T-24h a flat position has no time left to become a winner, and holding
+  //     it converts a decision into a coinflip resolved by the clock. DeepSeek
+  //     went +125% to +4.89% for want of exactly this.
+  //
+  //     Winners are deliberately NOT closed here. They are held into the
+  //     snapshot on the tightened trail applied at step 5, because the trail
+  //     turns the coinflip into a floor while leaving the upside intact.
+  if (phase === 'closeLosers' && r <= 0) {
+    return {
+      instId: position.instId,
+      rMultiple: r,
+      actions: [
+        {
+          kind: 'close_full',
+          reason: `endgame: ${r.toFixed(2)}R with the snapshot inside ${
+            config.competition.endgame.closeLosersHoursBeforeEnd
+          }h — losing and flat positions are closed`,
           cooldownUntilMs,
         },
       ],
@@ -228,9 +268,18 @@ export function evaluateExit(config: Config, position: PositionState, market: Ma
 
   // 5. Trail. Wide at first so ordinary noise cannot shake out the tail,
   //    tightening only once the trade is already large.
-  if (r >= exits.scaleOutAtR) {
-    const multiple =
-      r >= exits.tightenTrailAtR ? exits.tightenedChandelierAtrMultiple : exits.chandelierAtrMultiple;
+  //    In the endgame the trail also applies to trades that have NOT reached the
+  //    scale-out threshold. Normally a small winner is given room, because there
+  //    is time for it to become a large one; inside the last 24 hours there is
+  //    not, and an unprotected +0.5R at the snapshot is a gain we are choosing
+  //    to leave to chance.
+  const endgameTrail = phase === 'closeLosers' && r > 0;
+  if (r >= exits.scaleOutAtR || endgameTrail) {
+    const multiple = endgameTrail
+      ? config.competition.endgame.chandelierAtrMultiple
+      : r >= exits.tightenTrailAtR
+        ? exits.tightenedChandelierAtrMultiple
+        : exits.chandelierAtrMultiple;
 
     const trail = chandelierStop(position.side, market, multiple);
 

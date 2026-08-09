@@ -42,10 +42,16 @@ const request = (overrides: Partial<SizingRequest> = {}): SizingRequest => ({
   ...overrides,
 });
 
-const held = (instrument: string, correlationGroup: string, riskUsdt: number): OpenRisk => ({
+const held = (
+  instrument: string,
+  correlationGroup: string,
+  riskUsdt: number,
+  side: 'long' | 'short' = 'long',
+): OpenRisk => ({
   instrument,
   correlationGroup,
   riskUsdt,
+  side,
 });
 
 describe('maxLeverage must be verified before any order', () => {
@@ -194,7 +200,7 @@ describe('portfolio heat and correlation caps', () => {
     expect(() =>
       computeSize(config, {
         ...request({ targetPrice: 105 }),
-        openRisk: [held('ETH-PERP', 'eth-beta', 9.0), held('SOL-PERP', 'high-beta-alt', 9.0)],
+        openRisk: [held('ETH-PERP', 'eth-beta', 9.0, 'short'), held('SOL-PERP', 'high-beta-alt', 9.0, 'short')],
       }),
     ).toThrow(/portfolio heat would reach/);
   });
@@ -203,7 +209,7 @@ describe('portfolio heat and correlation caps', () => {
     // Risk still live is what counts, not the risk originally taken.
     const result = computeSize(config, {
       ...request({ targetPrice: 105 }),
-      openRisk: [held('ETH-PERP', 'eth-beta', 0), held('SOL-PERP', 'high-beta-alt', 0)],
+      openRisk: [held('ETH-PERP', 'eth-beta', 0, 'short'), held('SOL-PERP', 'high-beta-alt', 0, 'short')],
     });
     expect(result.heatAfter).toBeCloseTo(0.02, 6);
   });
@@ -226,7 +232,7 @@ describe('portfolio heat and correlation caps', () => {
     expect(() =>
       computeSize(config, {
         ...request({ targetPrice: 105, correlationGroup: 'high-beta-alt' }),
-        openRisk: [held('SOL-PERP', 'high-beta-alt', 0), held('DOGE-PERP', 'high-beta-alt', 0)],
+        openRisk: [held('SOL-PERP', 'high-beta-alt', 0, 'short'), held('DOGE-PERP', 'high-beta-alt', 0, 'short')],
       }),
     ).toThrow(/correlation group "high-beta-alt"/);
   });
@@ -235,7 +241,7 @@ describe('portfolio heat and correlation caps', () => {
     expect(() =>
       computeSize(config, {
         ...request({ targetPrice: 105, correlationGroup: 'btc-beta' }),
-        openRisk: [held('SOL-PERP', 'high-beta-alt', 0), held('DOGE-PERP', 'high-beta-alt', 0)],
+        openRisk: [held('SOL-PERP', 'high-beta-alt', 0, 'short'), held('DOGE-PERP', 'high-beta-alt', 0, 'short')],
       }),
     ).not.toThrow();
   });
@@ -257,5 +263,49 @@ describe('hard refusals', () => {
   it('refuses below the eligibility floor', () => {
     expect(() => assertAboveEligibilityFloor(config, 299.5)).toThrow(/eligibility floor/);
     expect(() => assertAboveEligibilityFloor(config, 300)).not.toThrow();
+  });
+});
+
+describe('the directional cap', () => {
+  it('refuses a third position on the same side even across different groups', () => {
+    // The correlation groups encode relationships we anticipated. This catches
+    // the ones we did not: E3 selects momentum extremes, and the extremes are
+    // usually one complex moving together, so a book that satisfies every group
+    // cap can still be a single bet placed three times.
+    expect(() =>
+      computeSize(config, {
+        ...request({ targetPrice: 105 }),
+        openRisk: [held('BTC-PERP', 'majors', 0, 'long'), held('SOL-PERP', 'layer1', 0, 'long')],
+      }),
+    ).toThrow(/a third position on the same side/);
+  });
+
+  it('permits a position that disagrees with the book', () => {
+    // A genuinely two-sided book is not concentration, and the cap must not
+    // become a position limit by another name.
+    expect(() =>
+      computeSize(config, {
+        ...request({ targetPrice: 97, stopPrice: 101, side: 'short' }),
+        openRisk: [held('BTC-PERP', 'majors', 0, 'long'), held('SOL-PERP', 'layer1', 0, 'long')],
+      }),
+    ).not.toThrow();
+  });
+
+  it('leaves the third slot reachable only by disagreeing', () => {
+    // With 3 slots and a cap of 2, the third position must take the other side
+    // or not exist. That is the whole intent, stated as a property.
+    expect(config.risk.maxPositionsPerSide).toBeLessThan(config.risk.maxConcurrentPositions);
+  });
+
+  it('names the gate that refused, so the ledger records which one it was', () => {
+    try {
+      computeSize(config, {
+        ...request({ targetPrice: 105 }),
+        openRisk: [held('BTC-PERP', 'majors', 0, 'long'), held('SOL-PERP', 'layer1', 0, 'long')],
+      });
+      expect.unreachable('should have refused');
+    } catch (error) {
+      expect((error as RiskRefusal).code).toBe('directional_cap');
+    }
   });
 });

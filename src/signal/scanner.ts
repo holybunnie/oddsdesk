@@ -23,6 +23,27 @@ export interface UniverseMember {
   readonly spec: InstrumentSpec;
   readonly ticker: TickerSnapshot;
   readonly spreadBps: number;
+  /** USDT notional of one minimum-size order, at the current price. */
+  readonly minNotionalUsdt: number;
+}
+
+/** Why an instrument was rejected by E1, for the scan report. */
+export interface UniverseRejection {
+  readonly instId: string;
+  readonly reason: 'excluded' | 'no_ticker' | 'volume' | 'spread' | 'min_size';
+  readonly detail: string;
+}
+
+/**
+ * Notional of the smallest order the venue will accept on an instrument.
+ *
+ * `minSize` is in CONTRACTS, and one contract is `contractValue` of the base
+ * asset — on BTC-USDT-SWAP that multiplier is 0.01, so reading minSize as coins
+ * would misjudge the minimum by a hundredfold in the direction that admits an
+ * instrument we cannot afford.
+ */
+export function minOrderNotionalUsdt(spec: InstrumentSpec, price: number): number {
+  return spec.minSize * spec.contractValue * price;
 }
 
 export interface RegimeVerdict {
@@ -71,32 +92,84 @@ export function selectUniverse(
   instruments: readonly InstrumentSpec[],
   tickers: readonly TickerSnapshot[],
 ): readonly UniverseMember[] {
+  return selectUniverseWithRejections(config, instruments, tickers).members;
+}
+
+/**
+ * E1 with its rejections retained.
+ *
+ * The counts matter as much as the survivors. Breadth is the strategy's central
+ * assumption, and an instrument dropped for minimum size is a very different
+ * fact about the venue than one dropped for volume — the first says our capital
+ * cannot reach it at any threshold we might tune, and no amount of loosening the
+ * volume filter will bring it back.
+ */
+export function selectUniverseWithRejections(
+  config: Config,
+  instruments: readonly InstrumentSpec[],
+  tickers: readonly TickerSnapshot[],
+): { members: readonly UniverseMember[]; rejections: readonly UniverseRejection[] } {
   const excluded = new Set(config.universe.excludeSymbols);
   const tickerById = new Map(tickers.map((t) => [t.instId, t]));
 
   const members: UniverseMember[] = [];
+  const rejections: UniverseRejection[] = [];
+  const reject = (instId: string, reason: UniverseRejection['reason'], detail: string): void => {
+    rejections.push({ instId, reason, detail });
+  };
 
   for (const spec of instruments) {
     if (!spec.instId.endsWith('-USDT-SWAP')) continue;
     if (spec.state !== 'live') continue;
-    if (excluded.has(baseSymbol(spec.instId))) continue;
+    if (excluded.has(baseSymbol(spec.instId))) {
+      reject(spec.instId, 'excluded', 'on the explicit exclusion list');
+      continue;
+    }
 
     const ticker = tickerById.get(spec.instId);
     // No ticker means no live two-sided market. Skipping is correct; defaulting
     // the spread to zero would admit an instrument we cannot price.
-    if (ticker === undefined) continue;
+    if (ticker === undefined) {
+      reject(spec.instId, 'no_ticker', 'no ticker, so no live two-sided market');
+      continue;
+    }
 
-    if (ticker.quoteVolume24h < config.universe.minQuoteVolume24hUsdt) continue;
+    if (ticker.quoteVolume24h < config.universe.minQuoteVolume24hUsdt) {
+      reject(spec.instId, 'volume', `24h quote volume ${ticker.quoteVolume24h.toFixed(0)} USDT`);
+      continue;
+    }
 
-    if (ticker.bid <= 0 || ticker.ask <= 0 || ticker.ask < ticker.bid) continue;
+    if (ticker.bid <= 0 || ticker.ask <= 0 || ticker.ask < ticker.bid) {
+      reject(spec.instId, 'spread', 'crossed or empty book');
+      continue;
+    }
     const mid = (ticker.bid + ticker.ask) / 2;
     const spreadBps = ((ticker.ask - ticker.bid) / mid) * 10_000;
-    if (spreadBps > config.universe.maxSpreadBps) continue;
+    if (spreadBps > config.universe.maxSpreadBps) {
+      reject(spec.instId, 'spread', `${spreadBps.toFixed(2)} bps`);
+      continue;
+    }
 
-    members.push({ instId: spec.instId, spec, ticker, spreadBps });
+    // Affordability. An instrument whose minimum order exceeds the smallest
+    // notional we would place is not breadth — it is a venue rejection waiting
+    // to happen, and because the signal is journalled before submission that
+    // rejection is never retried. It would show up in the scan as a candidate
+    // and never once as a position.
+    const minNotionalUsdt = minOrderNotionalUsdt(spec, mid);
+    if (minNotionalUsdt > config.universe.minTradableNotionalUsdt) {
+      reject(
+        spec.instId,
+        'min_size',
+        `minimum order is ${minNotionalUsdt.toFixed(2)} USDT, over the ` +
+          `${config.universe.minTradableNotionalUsdt} USDT we would place`,
+      );
+      continue;
+    }
+
+    members.push({ instId: spec.instId, spec, ticker, spreadBps, minNotionalUsdt });
   }
 
-  return members;
+  return { members, rejections };
 }
 
 /**

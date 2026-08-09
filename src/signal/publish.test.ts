@@ -3,11 +3,16 @@ import { loadConfig } from '../config.js';
 import {
   SignalCycle,
   SignalError,
+  buildExitSignal,
   buildSignal,
+  formatExitSignal,
   formatPrice,
   formatSignal,
+  leverageFor,
+  validateExitSignal,
   roundPrice,
   validateSignal,
+  type ExitSignalPlan,
   type SignalPlan,
   type ValidationContext,
 } from './publish.js';
@@ -25,6 +30,7 @@ const plan = (overrides: Partial<SignalPlan> = {}): SignalPlan => ({
   entryLow: 100,
   entryHigh: 101,
   stopPrice: 95,
+  scaleOutPrice: 113, // +2R off the band top, where E5 actually takes 25% off
   targetPrice: 119, // (101 - 95) * 3 + 101 = 119, exactly 3:1 off the band top
   sizePercent: 2,
   validUntilMs: NOW + 4 * HOUR,
@@ -118,7 +124,7 @@ describe('validateSignal — acceptance', () => {
 
   it('passes a well-formed short', () => {
     // Risk off the band low: 106 - 100 = 6, so the target must be at most 82.
-    const short = plan({ direction: 'short', stopPrice: 106, targetPrice: 82 });
+    const short = plan({ direction: 'short', stopPrice: 106, scaleOutPrice: 88, targetPrice: 82 });
     expect(check(short)).toEqual({ ok: true });
   });
 });
@@ -162,7 +168,7 @@ describe('validateSignal — rejection', () => {
   });
 
   it('rejects a size that is not expressed as a percentage', () => {
-    const text = formatSignal(config, plan()).replace('size 2%', 'size 6.4 USDT');
+    const text = formatSignal(config, plan()).replace('Position 2%', 'Position 6.4 USDT');
     const reasons = reasonsOf(check(plan(), text)).join(' ');
     expect(reasons).toMatch(/percentage 2%/);
   });
@@ -267,5 +273,109 @@ describe('SignalCycle accounting', () => {
     const cycle = new SignalCycle();
     cycle.delivered();
     expect(() => cycle.assertBalanced()).toThrow(SignalError);
+  });
+});
+
+describe('published leverage', () => {
+  it('publishes the EMERGENT leverage, which is the position size in other units', () => {
+    // The spec's canonical example says "LONG 3x". Publishing a nominal 3x while
+    // placing 0.8x is precisely the published-does-not-equal-placed failure Law
+    // 6 exists to prevent. notional/equity IS sizePercent, so there is no third
+    // number to invent.
+    expect(leverageFor(80)).toBe(0.8);
+    expect(leverageFor(250)).toBe(2.5);
+    expect(formatSignal(config, plan({ sizePercent: 80 }))).toContain('LONG 0.8x');
+    expect(formatSignal(config, plan({ sizePercent: 80 }))).toContain('Position 80%');
+  });
+
+  it('rejects a text whose stated leverage contradicts its stated size', () => {
+    // The redundancy is the point: two published fields carrying one quantity
+    // are checked against each other, so a change to one formatter and not the
+    // other is caught at the gate rather than shipped as a signal.
+    const text = formatSignal(config, plan({ sizePercent: 80 })).replace('0.8x', '3x');
+    expect(reasonsOf(check(plan({ sizePercent: 80 }), text)).join(' ')).toMatch(/emergent leverage 0.8x/);
+  });
+});
+
+describe('TP1 and TP2', () => {
+  it('publishes both, because they describe different events', () => {
+    const text = formatSignal(config, plan());
+    expect(text).toContain('TP1 113');
+    expect(text).toContain('TP2 119');
+  });
+
+  it('rejects a TP1 beyond TP2, which could never fire first', () => {
+    expect(reasonsOf(check(plan({ scaleOutPrice: 125 }))).join(' ')).toMatch(/TP1 must sit above/);
+  });
+
+  it('rejects a TP1 inside the entry band, which would fire on entry', () => {
+    expect(reasonsOf(check(plan({ scaleOutPrice: 100.5 }))).join(' ')).toMatch(/TP1 must sit above/);
+  });
+
+  it('checks the payoff ratio against TP2, the level that qualified the trade', () => {
+    // TP1 is a scale-out of a quarter; the ratio a subscriber can evaluate is
+    // the one measured to the screening target.
+    expect(reasonsOf(check(plan({ targetPrice: 110 }))).join(' ')).toMatch(/payoff ratio/);
+  });
+});
+
+describe('exit signals', () => {
+  const exit = (overrides: Partial<ExitSignalPlan> = {}): ExitSignalPlan => ({
+    exitId: 'X-2608091400-BTC-S',
+    refSignalId: 'S-2608091200-BTC-L',
+    instId: INST,
+    direction: 'long',
+    action: { kind: 'close', percent: 25 },
+    price: 113,
+    reason: 'reached +2.00R, taking 25% off',
+    ...overrides,
+  });
+
+  it('renders a scale-out under the character budget with the same header', () => {
+    // Same header, so the ASP classifier reads it as `perp` exactly as it reads
+    // an entry. A different header would classify half our traffic as text.
+    const text = formatExitSignal(config, exit());
+    expect(text.startsWith(config.publishing.perpHeader)).toBe(true);
+    expect(text.length).toBeLessThanOrEqual(config.publishing.maxSignalChars);
+    expect(text).toContain('EXIT LONG');
+    expect(text).toContain('CLOSE 25%');
+  });
+
+  it('renders a full close and a stop move', () => {
+    expect(formatExitSignal(config, exit({ action: { kind: 'close', percent: 100 } }))).toContain('CLOSE 100%');
+    expect(formatExitSignal(config, exit({ action: { kind: 'stop', to: 105 } }))).toContain('SL 105');
+  });
+
+  it('always references the entry signal it acts on', () => {
+    // Without the reference an exit fill is an orphan from the auditor's side —
+    // a trade with no corresponding signal, which is the gap this whole feature
+    // exists to close.
+    expect(formatExitSignal(config, exit())).toContain('ref S-2608091200-BTC-L');
+    const orphan = formatExitSignal(config, exit()).replace('S-2608091200-BTC-L', 'S-OTHER');
+    expect(reasonsOf(validateExitSignal(config, orphan, exit()))).toContainEqual(
+      expect.stringMatching(/does not reference the entry signal/),
+    );
+  });
+
+  it('rejects a close percentage outside (0, 100]', () => {
+    for (const percent of [0, -5, 101]) {
+      const plan = exit({ action: { kind: 'close', percent } });
+      expect(reasonsOf(validateExitSignal(config, formatExitSignal(config, plan), plan)).join(' ')).toMatch(
+        /close percentage/,
+      );
+    }
+  });
+
+  it('does NOT apply the entry gate — an exit describes a trade that already happened', () => {
+    // The asymmetry is deliberate. An entry is validated before the trade, so a
+    // failure costs a trade we were not obliged to take. An exit is validated
+    // after the close, so a geometry or payoff check could only ever refuse to
+    // describe something that has already occurred.
+    const text = buildExitSignal(config, exit({ action: { kind: 'stop', to: 1 } }));
+    expect(text).toContain('SL 1');
+  });
+
+  it('throws rather than returning an unpublishable exit record', () => {
+    expect(() => buildExitSignal(config, exit({ exitId: 'X 1' }))).toThrow(SignalError);
   });
 });
