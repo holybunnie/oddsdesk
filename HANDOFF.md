@@ -1,6 +1,6 @@
 # AlphaGate — Handoff
 
-**Last updated:** 2026-08-09 (session 3 — E4 tested and wired, publication gate built)
+**Last updated:** 2026-08-09 (session 4 — Trade Kit adapter and copy executor built)
 **Competition:** OKX.AI Hackathon Season 1
 **Registration closes:** Aug 11 12:00 UTC+8 — **the only irreversible deadline**
 **Trading window:** Aug 11 12:00 → Aug 25 12:00 UTC+8
@@ -10,7 +10,7 @@
 
 ## 1. Where things stand in one paragraph
 
-The venue-agnostic core is built and tested (**175 tests, typecheck clean**).
+The venue-agnostic core is built and tested (**248 tests, typecheck clean**).
 The whole signal path — E1 through E5 — is now complete and tested, and
 `scan.ts` runs it end to end against the live OKX venue and prints real entry
 candidates with bands, stops, targets and conviction breakdowns. The publication
@@ -18,9 +18,11 @@ gate (`validateSignal`) is built. Credentials are installed on the box and the
 order path is verified to reach the venue's margin check. Nothing can place a
 live order yet, by design: `maxLeverage` is unset until the stop kill test is
 observed, and `computeSize()` refuses to produce a position while it is unset.
-What remains is the execution half — the Trade Kit adapter and the copy
-executor — plus hardening. The two things blocking progress are both external:
-funding the sub-account, and registering the ASP.
+The execution half is now built too: the **Trade Kit adapter** speaks to the
+venue over the `okx` CLI, and the **copy executor** turns a published signal
+back into an order without forming an opinion of its own. What remains is the
+engine loop that joins the two halves, plus hardening. The two things blocking
+progress are both external: funding the sub-account, and registering the ASP.
 
 **Time check:** registration closes Aug 11 12:00 UTC+8, so it is now **~2 days
 out** and the practical deadline for starting is roughly **Aug 10 midday**
@@ -223,6 +225,58 @@ summary of one — the copy executor parses these numbers and acts on them.
   unconditionally turned `118000` into `118` — a price three orders of magnitude
   wrong that still looks like a price. There is a test.
 
+### `src/execution/tradekit.ts` — Route B adapter, complete (45 tests)
+`ExecutionAdapter` over the `okx` CLI. Shaped by CLI behaviour measured on
+2026-08-09, not by its documentation: with `--json` stdout is the bare `data`
+payload and the update banner goes to stderr; a failure exits non-zero and
+leaves stdout empty, so **exit code is the error signal**.
+
+- Money crosses the boundary as exact decimal strings converted to bigint minor
+  units. Never via `Number`: `0.07 * 1e8` is `7000000.000000001`, and a size
+  that rounds up is a size the venue rejects or fills larger than intended.
+  Excess precision **throws** rather than truncating a venue value.
+- `submitOrder` **refuses while stop custody is `unverified`**. `flatten` does
+  not — closing risk must outlive every other gate.
+- A `sCode` rejection inside an exit-0 response is reported as `rejected`.
+  Treating exit 0 as success would report a rejected order as accepted.
+- `stopResting` is **never claimed from the placement response**. `swap place`
+  acknowledges the order, not the attached algo; only `openPositions()`, which
+  reads the algo book back, can answer it. Claiming it would defeat the
+  GuardedExecutor check that trips the kill switch on a naked fill.
+- Resting stops are keyed by **instrument and side**. Hedge mode allows a long
+  and a short on one instId, and keying by instId alone reports the short's stop
+  as the long's — a naked position that looks protected.
+- `flatten` passes `--autoCxl`: a stop left behind on a flat position opens a
+  NEW position when it fires.
+- Sizes are in **contracts**, so `Instrument` now carries `contractValue`
+  (`ctVal`), required and explicitly nullable. On BTC-USDT-SWAP that multiplier
+  is 0.01 — sizing in coins would be a hundredfold error the venue accepts.
+
+### `src/execution/copy.ts` — copy executor, complete (28 tests)
+Deliberately the dumbest process in the system. Law 6 is only structurally true
+if the thing that places orders cannot form an opinion, so this module has **no
+strategy logic and no discretion**.
+
+- `parseSignal` is the **exact inverse of `formatSignal`**, pinned by a
+  round-trip test, and rigid: an unparseable body is a refusal, never a fallback
+  to a market order at a price nobody published.
+- The **publication gate is re-run on read-back**. The text checks pass
+  tautologically, but the geometry and payoff checks do not — that is what makes
+  an altered signal refused at the executor rather than traded on trust.
+- `requireMaxLeverage()` is consulted **here as well as upstream**, so an
+  executor pointed at a config whose Part IX verification has not been done
+  trades nothing at all. The refusal does not live in only one place.
+- The limit price is the **far edge of the published band** — the worst price
+  inside it. A limit fills there or better, so the band is honoured exactly and
+  a fill outside what was published is impossible.
+- Size **rounds down, never up**: rounding up spends more than the published
+  percentage said. Float error is settled before the floor, or an exact 0.24
+  contracts silently becomes 0.23.
+- The signal is journalled **before** submission. An order lost to a timeout
+  must not be retried on the next delivery — the venue may well hold it.
+- Every path returns a tagged `ExecutionOutcome`, so a signal that was not
+  traded is distinguishable from one that was never seen.
+
 ### `src/scripts/scan.ts`
 Live observability tool, now running **E1 → E4**. Run it any time:
 
@@ -289,22 +343,36 @@ universe, which is the right order of magnitude.
 ~~7. Signal formatting and `validateSignal()`.~~ **Done** — `src/signal/publish.ts`,
 32 tests.
 
+~~8. Trade Kit execution adapter.~~ **Done** — `src/execution/tradekit.ts`,
+45 tests.
+~~9. Copy executor.~~ **Done** — `src/execution/copy.ts`, 28 tests.
+
 **Start here next session:**
 
-8. **Trade Kit execution adapter** — implements `ExecutionAdapter` against the
-   `okx` CLI. Interface already exists; this is the concrete class. Note the CLI
-   needs `--profile okx-sub` and the IPv4 `NODE_OPTIONS` on every call.
-9. **Copy executor** — the deliberately dumb process. Parses published signals,
-   deduplicates, checks positions and budget, submits, reconciles. **No strategy
-   logic and no discretion** — that separation is what makes Law 6 structural.
+12 first, then 10. The engine loop is what turns a pile of tested modules into
+a running agent, and it is the last thing that can be built without funding.
+
 10. **Server hardening** — systemd units with `MemoryMax`, ufw, NTP, alerts,
     pending reboot (`libc6` + kernel update outstanding).
 11. **Leaderboard parser** — Aug 11 only, against the real page.
-12. **Wire the engine loop** — the piece that joins what now exists:
+12. **Wire the engine loop** — *do this first* — the piece that joins what now exists:
     scan → E4 → `computeSize()` → `buildSignal()` → publish → `GuardedExecutor`.
     Two things it must own that nothing else can: the **cooldown state** E4
     expects (`scan.ts` is stateless and passes none), and a `SignalCycle` per
-    cycle with `assertBalanced()` at the end.
+    cycle with `assertBalanced()` at the end. Both halves it joins now exist —
+    what is missing is only the loop between them.
+
+    Three specifics it has to supply, which the modules deliberately do not
+    default:
+
+    - A **persistent** `SignalJournal`. The in-memory one loses its dedupe set
+      on restart; the deterministic clOrdId is the second line of defence, not
+      the first.
+    - The `instruments` map, from `describeVenue()`. The copy executor refuses
+      an undiscovered symbol rather than guessing its scale, so discovery has to
+      run before the first signal.
+    - `stopCustody` read from the runtime profile, never a literal at the call
+      site.
 
 ---
 
@@ -320,6 +388,13 @@ universe, which is the right order of magnitude.
 - **Demo is a separate environment** with separate credentials.
 - **ASP classification is keyword-driven** on name/title/description. Assert the
   service maps to `perp` at daemon startup and refuse to start otherwise.
+- **`minSz` is not checked by the copy executor.** It sizes, then lets the
+  venue be the authority on the minimum. A rejection is recorded as a refusal —
+  but the signal is already journalled, so it will not be retried. Correct, and
+  worth knowing before it looks like a bug.
+- **Published prices carry five significant figures**, which can be finer than
+  the tick on a cheap perp and coarser than the venue would allow on BTC.
+  `priceToMinor` snaps to the tick; the placed price is the published price.
 - **The reference delivery daemon exits zero on JWT expiry**, so
   `Restart=always` may not restart it. Exit non-zero, write a liveness file,
   and monitor off-box.
