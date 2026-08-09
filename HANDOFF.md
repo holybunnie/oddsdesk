@@ -1,6 +1,6 @@
 # AlphaGate — Handoff
 
-**Last updated:** 2026-08-09 (session 4 — Trade Kit adapter and copy executor built)
+**Last updated:** 2026-08-09 (session 5 — engine loop built; the code path is complete)
 **Competition:** OKX.AI Hackathon Season 1
 **Registration closes:** Aug 11 12:00 UTC+8 — **the only irreversible deadline**
 **Trading window:** Aug 11 12:00 → Aug 25 12:00 UTC+8
@@ -10,7 +10,7 @@
 
 ## 1. Where things stand in one paragraph
 
-The venue-agnostic core is built and tested (**248 tests, typecheck clean**).
+The venue-agnostic core is built and tested (**276 tests, typecheck clean**).
 The whole signal path — E1 through E5 — is now complete and tested, and
 `scan.ts` runs it end to end against the live OKX venue and prints real entry
 candidates with bands, stops, targets and conviction breakdowns. The publication
@@ -18,11 +18,12 @@ gate (`validateSignal`) is built. Credentials are installed on the box and the
 order path is verified to reach the venue's margin check. Nothing can place a
 live order yet, by design: `maxLeverage` is unset until the stop kill test is
 observed, and `computeSize()` refuses to produce a position while it is unset.
-The execution half is now built too: the **Trade Kit adapter** speaks to the
-venue over the `okx` CLI, and the **copy executor** turns a published signal
-back into an order without forming an opinion of its own. What remains is the
-engine loop that joins the two halves, plus hardening. The two things blocking
-progress are both external: funding the sub-account, and registering the ASP.
+The execution half is built too — the **Trade Kit adapter** over the `okx` CLI
+and the **copy executor** — and the **engine loop** now joins them, so the code
+path from market data to a placed order is complete end to end. What remains is
+hardening, the leaderboard parser (Aug 11 only), and the live verification that
+`maxLeverage` depends on. The two things blocking progress are both external:
+funding the sub-account, and registering the ASP.
 
 **Time check:** registration closes Aug 11 12:00 UTC+8, so it is now **~2 days
 out** and the practical deadline for starting is roughly **Aug 10 midday**
@@ -277,6 +278,57 @@ strategy logic and no discretion**.
 - Every path returns a tagged `ExecutionOutcome`, so a signal that was not
   traded is distinguishable from one that was never seen.
 
+### `src/engine/state.ts` — durable engine state
+The three things that are inherently temporal and cannot live in a pure
+function, all surviving restart, written atomically via rename:
+
+- **Cooldowns.** E4 accepts a `cooldownUntilMs` but cannot know it. A cooldown
+  that resets on restart is an invitation to re-enter the instrument that just
+  stopped us out, exactly when a crash makes a restart likely.
+- **Position history** — entry, ORIGINAL stop, extreme since entry, opened-at.
+  The venue reports none of these; it knows size and mark, not what R means for
+  this trade. Losing the extreme silently loosens every trailing stop back to
+  its entry-time value, the one move `ratchetStop` exists to forbid.
+- **Peak equity**, so the governor's measurement outlives the process.
+
+A corrupt state file **refuses to start** rather than presenting an empty book —
+a cold start must be an explicit decision, never a fallback.
+`withObservedPrice` only ever widens the anchors.
+
+### `src/engine/loop.ts` — the engine loop, complete (28 tests)
+What it adds is **order**, and the order is the design:
+
+1. Reconcile against the venue.
+2. Manage open positions (E5).
+3. Check the governor.
+4. Only then look for entries — size → publish → execute.
+
+**Steps 1-2 run unconditionally**: kill switch tripped, regime unfavourable,
+governor halted, it does not matter. An engine that stops managing its book has
+not become safe, it has become an abandoned book. Only step 4 is gated.
+
+- Law 6 runs one way: `computeSize` → `buildSignal` → `publish` →
+  `copyExecutor.execute(text)`. The executor receives the **text, never the
+  plan**, so no decision can reach the venue without passing through its own
+  published record. A signal whose **delivery failed is not traded**.
+- `SignalCycle.assertBalanced()` runs in a `finally`, so a mid-cycle throw
+  cannot hide a dropped signal — but when the books are straight it must not
+  mask the real fault, and a test pins that too.
+- Candidates are taken **strongest conviction first**. Slots and heat are
+  finite, so consideration order allocates capital; scan order would allocate it
+  alphabetically.
+- A new position is added to the **running heat within the same cycle**, so the
+  second candidate is sized against a book that includes the first.
+- The governor is applied in **one place only** — `computeSize` already halves
+  the risk fraction, so the loop does not halve it again.
+- A position it cannot price **throws**. The alternative is trailing a stop off
+  a stale number.
+
+`correlationGroupFor()` and the new `correlationGroups` config make
+`maxPositionsPerCorrelationGroup` mean something; an unlisted symbol gets its
+own bucket rather than being pooled into a shared "other" that would make two
+unrelated small caps count as a correlated pair.
+
 ### `src/scripts/scan.ts`
 Live observability tool, now running **E1 → E4**. Run it any time:
 
@@ -346,35 +398,36 @@ universe, which is the right order of magnitude.
 ~~8. Trade Kit execution adapter.~~ **Done** — `src/execution/tradekit.ts`,
 45 tests.
 ~~9. Copy executor.~~ **Done** — `src/execution/copy.ts`, 28 tests.
+~~12. Wire the engine loop.~~ **Done** — `src/engine/loop.ts` + `state.ts`,
+28 tests.
 
 **Start here next session:**
 
-12 first, then 10. The engine loop is what turns a pile of tested modules into
-a running agent, and it is the last thing that can be built without funding.
+10 and 11 are what remain in code. Before either, the loop needs its **driver**:
+`runCycle()` takes a `ScanResult` and returns a report, but nothing yet builds
+that `ScanResult` from `scan.ts`'s E1-E4 pass on a timer, and nothing implements
+`SignalPublisher` against the ASP. Both are small and both are the last things
+standing between the tested modules and a running agent.
 
 10. **Server hardening** — systemd units with `MemoryMax`, ufw, NTP, alerts,
     pending reboot (`libc6` + kernel update outstanding).
 11. **Leaderboard parser** — Aug 11 only, against the real page.
-12. **Wire the engine loop** — *do this first* — the piece that joins what now exists:
-    scan → E4 → `computeSize()` → `buildSignal()` → publish → `GuardedExecutor`.
-    Two things it must own that nothing else can: the **cooldown state** E4
-    expects (`scan.ts` is stateless and passes none), and a `SignalCycle` per
-    cycle with `assertBalanced()` at the end. Both halves it joins now exist —
-    what is missing is only the loop between them.
+12. ~~**Wire the engine loop**~~ — done. What is still missing around it:
 
-    Three specifics it has to supply, which the modules deliberately do not
-    default:
-
-    - A **persistent** `SignalJournal`. The in-memory one loses its dedupe set
-      on restart; the deterministic clOrdId is the second line of defence, not
-      the first.
-    - The `instruments` map, from `describeVenue()`. The copy executor refuses
-      an undiscovered symbol rather than guessing its scale, so discovery has to
-      run before the first signal.
+    - A **driver** that runs E1-E4 on a timer and hands `runCycle()` a
+      `ScanResult` (candidates, regime verdict, last prices, ATRs, feed
+      freshness). `scan.ts` already computes all of it; it prints rather than
+      returns.
+    - A **`SignalPublisher`** against the ASP. `publish()` must resolve only
+      once the signal is genuinely delivered — resolving optimistically would
+      let the engine trade a signal whose record never arrived, which is the
+      precise inversion of Law 6.
     - `stopCustody` read from the runtime profile, never a literal at the call
       site.
+    - A **persistent `SignalJournal`** for the copy executor. `EngineState` is
+      the obvious home; the in-memory one loses its dedupe set on restart, and
+      the deterministic clOrdId is the second line of defence, not the first.
 
----
 
 ## 7. Traps already identified — do not rediscover these the hard way
 
@@ -388,6 +441,13 @@ a running agent, and it is the last thing that can be built without funding.
 - **Demo is a separate environment** with separate credentials.
 - **ASP classification is keyword-driven** on name/title/description. Assert the
   service maps to `perp` at daemon startup and refuse to start otherwise.
+- **`riskUsdt` is an AMOUNT, not a price distance.** Using the raw stop distance
+  reads as hundreds of percent of portfolio heat and refuses every subsequent
+  trade. `openRiskUsdt()` converts contract minor units through both the lot
+  scale and the contract multiplier. There is a test.
+- **The governor lives in `computeSize` only.** It halves the risk fraction
+  there; halving again in the loop quartered the position while the ledger still
+  called it a halve.
 - **`minSz` is not checked by the copy executor.** It sizes, then lets the
   venue be the authority on the minimum. A rejection is recorded as a refusal —
   but the signal is already journalled, so it will not be retried. Correct, and
