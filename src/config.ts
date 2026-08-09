@@ -109,6 +109,25 @@ export const configSchema = z
       .strict()
       .refine((r) => r.minRealizedVol < r.maxRealizedVol, 'the volatility band must be non-empty'),
 
+    /**
+     * Correlation groups, keyed by group name, valued by base symbol.
+     *
+     * Policy, not a venue fact: it is our judgement about what moves together.
+     * `maxPositionsPerCorrelationGroup` is meaningless without it — crypto perps
+     * correlate around 0.8, so three longs is one trade wearing three hats, and
+     * an ungrouped universe would let exactly that through.
+     */
+    correlationGroups: z.record(z.string().min(1), z.array(z.string().min(1)).min(1)),
+
+    /**
+     * Prefix for a base symbol named in no list, e.g. `ungrouped:FARTCOIN`.
+     *
+     * A PREFIX, not a group name. A single shared "other" bucket would make two
+     * unrelated small caps count as a correlated pair and refuse a trade we
+     * cannot justify refusing.
+     */
+    ungroupedPrefix: z.string().min(1),
+
     ranking: z
       .object({
         lookbacksHours: z.array(z.number().int().positive()).min(1),
@@ -191,6 +210,7 @@ export const configSchema = z
 
     ledger: z.object({ path: z.string().min(1) }).strict(),
     killSwitch: z.object({ path: z.string().min(1) }).strict(),
+    engineState: z.object({ path: z.string().min(1) }).strict(),
 
     publishing: z
       .object({

@@ -146,6 +146,62 @@ regime:
   # a crowding signal. Expressed per funding interval, as a fraction.
   maxAdverseFundingRate: 0.0005
 
+# Correlation groups. POLICY: our judgement about what moves together, not a
+# venue fact. maxPositionsPerCorrelationGroup does nothing without this — perps
+# correlate around 0.8, so three "different" longs is one trade wearing three
+# hats, which is the failure mode that kills accounts in a drawdown.
+#
+# Deliberately coarse. A fine-grained taxonomy would let three L1 alts through
+# as three groups, which is the exact concentration this is meant to prevent.
+correlationGroups:
+  majors:
+    - BTC
+    - ETH
+  layer1:
+    - SOL
+    - AVAX
+    - ADA
+    - DOT
+    - ATOM
+    - NEAR
+    - APT
+    - SUI
+    - SEI
+    - TON
+    - TRX
+    - BNB
+  layer2:
+    - ARB
+    - OP
+    - MATIC
+    - POL
+    - STRK
+    - ZK
+    - MANTA
+  defi:
+    - UNI
+    - AAVE
+    - LINK
+    - MKR
+    - CRV
+    - LDO
+    - PENDLE
+    - ENA
+  memes:
+    - DOGE
+    - SHIB
+    - PEPE
+    - WIF
+    - BONK
+    - FLOKI
+    - TRUMP
+
+# Prefix, not a group name: an unlisted symbol becomes "ungrouped:FARTCOIN" and so
+# gets its own bucket. Pooling everything unlisted into one "other" group would
+# make two unrelated small caps count as a correlated pair, which is a refusal
+# we could not justify.
+ungroupedPrefix: ungrouped
+
 ranking:
   # E3. Momentum normalised by ATR so a 3% BTC move and a 12% alt move are
   # comparable. Multiple lookbacks so a single bar cannot dominate.
@@ -228,6 +284,12 @@ ledger:
 
 killSwitch:
   path: var/kill-switch
+
+# Cooldowns, open-position history and peak equity. Must survive restart: a
+# cooldown that resets on restart invites re-entry into the instrument that just
+# stopped us out, exactly when a crash makes a restart likely.
+engineState:
+  path: var/engine-state.json
 
 publishing:
   maxSignalChars: 200
