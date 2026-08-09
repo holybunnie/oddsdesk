@@ -8,6 +8,54 @@
 
 ---
 
+## 0. The two halves — read this if nothing else
+
+Naming, because it has caused confusion: the **repo** is `oddsdesk`; the
+**product** is **AlphaGate**, which is the name of the *signal service* we
+publish through. That name comes from build spec Part IV. Nothing is registered
+anywhere yet, so it can still be changed at zero cost.
+
+This competition has two halves and they are not independent.
+
+**Half one — the trading brain.** Fund a sub-account with 320 USDT and trade
+USDT perpetuals for two weeks. Best combined return wins. This is the scanner,
+the entry and exit rules, the risk limits. **Built and tested.**
+
+**Half two — the publishing service (the ASP).** OKX does not let you simply
+trade. You must publish every trade as a *signal* through a service other people
+could subscribe to, and OKX checks your real trades against those published
+signals. If they do not correspond, the ranking does not count. **Not built, not
+deployed, not registered.**
+
+**They are wired together deliberately.** The executor's input is published
+signal *text*, not an internal decision object, so no order can reach the venue
+without having been published first. That makes Law 6 structural rather than a
+promise — and it also means the finished trading brain is **complete and idle**
+until the publishing service exists.
+
+### Trading half — what works, and what has never run
+
+Verified against live OKX on 2026-08-09: 423 instruments in → 79 passed the
+liquidity filter → 11 reached the entry gate → **5 signals** (BOME, PEOPLE,
+PARTI, NEIRO, ESP, all long). Real prices, real ATRs, real conviction scores.
+
+Built and tested (292 tests): E1 universe filter · E2 regime gate (stands down
+in chop) · E3 volatility-adjusted momentum ranking · E4 breakout entry with a
+conviction gate at 75 · E5 exits (2×ATR stop, 25% off at +2R, breakeven, 3×ATR
+Chandelier trail tightening to 2.5× past +4R, 12h time stop, 4h cooldown) ·
+sizing with no override path · portfolio heat cap · drawdown governor ·
+kill switch · hash-chained append-only ledger · Trade Kit adapter · copy
+executor · engine loop · driver.
+
+**It cannot place a single order, by design.** `execution.maxLeverage` is unset
+and `computeSize()` throws rather than defaulting. It stays that way until the
+Part IX stop kill test is observed. **Nothing here has touched real money** —
+and per Law 7, a safety mechanism that has never fired in a test does not exist.
+
+Still missing on the trading side: E6 pyramiding and E7 fee budget are in config
+but read by no code; daily attribution (Part VIII) is unbuilt; the leaderboard
+parser cannot be written until the page exists on Aug 11.
+
 ## 1. Where things stand in one paragraph
 
 The venue-agnostic core is built and tested (**292 tests, typecheck clean**).
@@ -37,20 +85,88 @@ the one thing that cannot be recovered by working harder later.
 
 ---
 
-## 1a. READ THIS FIRST — `docs/asp-and-competition.md`
+## 1a. The two documents in `docs/`
 
-The authoritative ASP registration path, signal format, delivery-daemon CLI and
-competition rules are captured in **[`docs/asp-and-competition.md`](docs/asp-and-competition.md)**,
-checked against the event page and the OKX dev portal on 2026-08-09. It marks
-what is verbatim from source, what is our reading, and what is still unknown.
+| Document | What it is |
+|---|---|
+| **[`docs/BUILD-SPEC-v2.md`](docs/BUILD-SPEC-v2.md)** | The **governing document**, stored verbatim so it never has to be pasted into a session again. |
+| **[`docs/asp-and-competition.md`](docs/asp-and-competition.md)** | The **annex**: exact source quotes from the event page and OKX dev portal (2026-08-09), marked verbatim vs. our reading, plus §9 — the gaps found in the spec. |
 
-Do not re-derive any of it from memory. Two things it corrects that were wrong
-in earlier sessions:
+Two things the annex corrects that were wrong in earlier sessions:
 
-- **The ASP is built and listed BEFORE it is registered**, and competition entry
-  comes after ASP approval. Registration is the output of deployment.
+- **The ASP is built, deployed and listed BEFORE it is registered**, and
+  competition entry is a *separate second gate* after ASP approval.
 - **The service is A2A monthly subscription**, so no public HTTPS endpoint is
   required — and exactly one subscription service may exist, never deleted.
+
+### Gaps found in the build spec
+
+Full detail in the annex §9. Three of these block registration outright.
+
+**Blocks registration:**
+
+1. **The name is too long for both fields.** `AlphaGate — Perpetual Momentum
+   Signals` is **38 chars**; agent name caps at EN 3–25, service name at 5–30.
+   Split: agent `AlphaGate` (9) + service `Perpetual Momentum Signals` (26).
+   Safe, because the classifier reads name + title + description concatenated,
+   so the mandatory `Perpetual` keyword still lands.
+2. **An avatar is mandatory and the spec never mentions one.** An uploaded image
+   file ≤1 MB. Links rejected, no default for the ASP role. We have none.
+3. **One ASP per wallet address.** If the wallet already holds one, `create` is
+   refused and the flow forces an update instead.
+
+**Missing infrastructure:**
+
+4. **`onchainos` and `okx-a2a` are not in spec Part XII** but the delivery
+   daemon shells out to both. Install: `npx skills add okx/onchainos-skills --yes -g`.
+5. **Agentic Wallet login is email + browser, on a headless box.** The daemon
+   emits a login URL to complete in a browser then polls. Recurs on every JWT
+   expiry — which is Trap 4.
+6. **Four processes on a 2 GB box.** Part XII caps three units at 1.25 GB, but
+   the Python daemon is a fourth with no cap, and `delphi-agent` is an unrelated
+   project on the same box.
+
+**Missing integration:**
+
+7. **How the signal engine reaches the daemon is unspecified.** Engine is
+   TypeScript, daemon is Python. Either the engine writes `signals.txt` for
+   `asp_push.py`, or it shells `onchainos agent deliver` itself. This is the
+   `SignalPublisher` implementation — the last placeholder in running code.
+   Part IV mandates *scheduled* push for the 45 s heartbeat while our engine is
+   event-driven, so likely both: autopilot for heartbeat, engine for delivery.
+8. **Subscribing to our own ASP has no build task**, though Part III and
+   tutorial step 5 both require it for copy trading.
+9. **Competition registration is a second gate** after ASP approval — bind the
+   OKX UID, fund ≥300 USDT. Part XIII says only "register early".
+
+**Smaller:** the spec's `classify()` table omits `option` and
+`defi|liquidity|lp`; the free trial is fixed at exactly 72 h; the fee must be a
+quoted digits-only string (`"15"`, never `15 USDT`); prizes run 4th–40th at $500
+each; rule 3.2 requires the service to stay usable **by other subscribers**.
+
+### Where our build diverged from the spec
+
+10. **`formatSignal` does not match the spec's own canonical shape.** Our defect
+    — the implementation predates reading Part IV.
+
+    - Spec: `[Perpetual Signal] SOL-PERP | LONG 3x | Entry 182.4-183.1 | SL 176.8 | TP1 199.2 | Position 8% | Valid for 6h`
+    - Ours: `[Perpetual Signal] LONG BTC-USDT-SWAP entry 64700-64800 stop 64000 target 67200 size 40% id S-...`
+
+    Different delimiters and labels, no leverage, no validity window, an extra
+    id, `-USDT-SWAP` instead of `-PERP`. **Fix `src/signal/publish.ts`.** Two
+    open questions for the planning agent:
+
+    - The spec's published-field list has **no signal id**, and Law 6 requires
+      traceability *from logs*. The id could live in the ledger against the
+      delivery `jobId`, freeing ~24 of the 200 characters — but `CopyExecutor`
+      dedupes on the id in the text today, so dedupe would move to the `jobId`.
+    - **Asset naming:** spec and both official examples say `-PERP`; Trade Kit
+      places orders against the instId `-USDT-SWAP`. Ours can map; a third-party
+      subscriber's agent would have to as well.
+
+11. **The build order was not followed.** Part XIII puts the ASP at stage 2,
+    *before* the Trade Kit adapter at stage 3, precisely because of the deadline.
+    We built 3, 5, 6, 7 and have not started 1 or 2.
 
 ## 2. Decisions already made (do not relitigate without reason)
 
@@ -435,21 +551,24 @@ It is stateless, so it passes no cooldown. The live engine must.
    deposit**, so a later top-up permanently raises the denominator and damages
    half the score.
 
-2. **Register the ASP** — `AlphaGate — Perpetual Momentum Signals`.
-   The word **"Perpetual" is mandatory** in the registered name; without a
-   matching keyword the delivery daemon classifies the service as `text`, which
-   delivers successfully and executes nothing. Review takes ~24h with the ASP
-   online throughout, and registration closes **Aug 11 12:00 UTC+8**.
-   Listing copy is in the spec, Part IV.
+2. **An avatar image for the ASP** — required to register, and we have none.
+   An image file ≤1 MB, 1:1 square recommended. Links are rejected; there is no
+   default for the ASP role. Hard blocker on registration.
 
-3. **Optional but recommended — a demo API key.**
+3. **Confirm the ASP name split.** The spec's 38-char name fits neither field.
+   Proposed: agent `AlphaGate`, service `Perpetual Momentum Signals`. The word
+   **"Perpetual" is mandatory** somewhere in name/title/description — without it
+   the daemon classifies the service as `text`, which delivers successfully and
+   executes nothing.
+
+4. **Optional but recommended — a demo API key.**
    OKX → Demo trading → API key (Read + Trade, Perpetual). Then on the box:
    `okx config init`, answer `1`, **`Y`** to demo, profile name `okx-demo`.
    Without it the stop kill test must run on live money.
 
 ### Blocked on funding (not on time)
 
-4. **Part IX stop verification — the gate on everything.**
+5. **Part IX stop verification — the gate on everything.**
    Open a minimum-size position, attach a stop, `kill -9` the agent, inspect
    from the venue side whether the stop still rests, reboot the box, inspect
    again. Result decides:
@@ -533,18 +652,35 @@ Then 10 and 11.
 
 ## 8. Sequence from here
 
+Corrected for the two-gate ordering. The ASP branch starts with deployment, not
+with registration.
+
 ```
-fund sub-account (320)  ──┐
-demo API key (optional) ──┼──▶ stop kill test ──▶ write maxLeverage ──▶ live minimum-size order
-register ASP ─────────────┘                                                      │
-   (~24h review, deadline Aug 11 12:00 UTC+8)                                     ▼
-                                                              E4/E5 + executor + hardening
-                                                                                  ▼
-                                                              freeze → 24h dry run → Aug 11
+  avatar image ──────┐
+  name decision ─────┤
+  fix formatSignal ──┼──▶ deploy to VPS ──▶ daemon online ──▶ LIST service
+  onchainos+okx-a2a ─┤   (spec stage 1)     (45s heartbeat)         │
+  publisher wired ───┘                                              ▼
+                                                   ~24h REVIEW, ASP online throughout
+                                                                    │
+                                                                    ▼
+                                                              ASP approved
+                                                                    │
+  fund sub-account (320) ───────────────────────────────────────────┤
+  demo API key (optional) ──────────────────────────────────────────┤
+                                                                    ▼
+                                         COMPETITION REGISTRATION (bind UID, >=300 USDT)
+                                                  deadline Aug 11 12:00 UTC+8
+                                                                    │
+  stop kill test ──▶ write maxLeverage ──▶ live minimum-size order ──┤
+                                                                    ▼
+                                          freeze → 24h dry run → Aug 11 12:00 trading opens
 ```
 
-**The ASP is the critical path**, not the code. Everything else can be built in
-parallel; registration cannot be started late.
+**Working backwards from the deadline:** competition registration closes
+**Aug 11 12:00 UTC+8** and requires an approved ASP. Approval takes ~24h with the
+service online throughout. So the service must be **listed and running by roughly
+Aug 10 midday UTC+8** — which makes deployment, not code, the binding constraint.
 
 ---
 
