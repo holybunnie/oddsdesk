@@ -992,3 +992,51 @@ The verification output must contain one complete line beginning with
 `ssh-ed25519`. Existing authorized keys must be preserved. After that, obtain
 the VPS public IPv4/DNS name and test SSH from this workspace using the local
 private key. Only then perform the system reboot and continue deployment.
+
+## 11. VPS deployment state — 2026-08-09
+
+SSH was verified successfully with the dedicated key:
+
+- Host: `54.154.121.30`
+- User: `ubuntu`
+- Remote identity: `ip-172-26-14-25`
+- OS: Ubuntu 24.04.4 LTS
+- Kernel: `6.17.0-1019-aws`
+- `/var/run/reboot-required` exists; **no reboot has been performed**
+- 2 GiB RAM + 2 GiB swap; `chrony` active; no failed systemd units
+
+The existing `/home/ubuntu/p` repository is `holybunnie/probe` and its
+`delphi-agent.service`/`delphi-paper.service` units were inspected but not
+modified. Oddsdesk is isolated separately:
+
+- Staging clone: `/home/ubuntu/oddsdesk`
+- Service clone: `/opt/oddsdesk`
+- Dedicated service account: `oddsdesk` (non-login)
+- Both clones are at commit `ab30fad79b25a9065d7ad1c0eba4e045f43cf8dc`
+- VPS `npm ci`, typecheck, build, and registration validation passed
+
+Installed on the VPS:
+
+- Onchain OS CLI `4.4.9` (service-accessible copy at `/usr/local/bin/onchainos`)
+- OKX Trade CLI `1.4.2` (`/usr/bin/okx`)
+- `okx-a2a` `0.2.2` (`/usr/bin/okx-a2a`)
+
+`onchainos preflight` passed. `okx-a2a doctor` currently reports provider
+binding missing and the daemon not running; this needs the real provider/auth
+setup, not a guessed configuration. The service runtime profile,
+`OKX_ASP_AGENT_ID`, and venue stop-custody result are also not present yet, so
+the live engine has correctly not been started. Do not copy the existing
+`ubuntu` OKX credentials into the `oddsdesk` account without an explicit
+credential setup decision.
+
+### Next deployment actions
+
+1. Decide/configure the service-account OKX authentication and A2A provider.
+2. Run the Day-0 venue discovery and record
+   `config/runtime-profile.tradekit.yaml` (including position mode, leverage,
+   fees, and stop custody).
+3. Bind the reviewed `OKX_ASP_AGENT_ID` and run the dry cycle.
+4. Install the systemd units and enable only the unit permitted by the stop
+   custody result; watchdog is required only for client-held stops.
+5. Obtain explicit approval before the pending system reboot, then verify SSH,
+   systemd, and the other project services after reboot.
