@@ -1023,20 +1023,28 @@ Installed on the VPS:
 
 `onchainos preflight` passed. `okx-a2a doctor` currently reports provider
 binding missing and the daemon not running; this needs the real provider/auth
-setup, not a guessed configuration. The service runtime profile,
-`OKX_ASP_AGENT_ID`, and venue stop-custody result are also not present yet, so
-the live engine has correctly not been started. Do not copy the existing
-`ubuntu` OKX credentials into the `oddsdesk` account without an explicit
-credential setup decision.
+setup, not a guessed configuration. The existing CEX profiles are configured
+under `ubuntu` (`okx-sub` is the default), but their credentials have not been
+copied into the `oddsdesk` account.
+
+The first read-only OKX.AI identity lookup returned `session expired:
+onchainos wallet login`. This confirms that the ASP identity flow requires an
+authenticated Agentic Wallet session in this environment. **Do not start
+wallet login, create/fund a wallet, sign, or move wallet assets without the
+operator's explicit authorization.** No wallet action has been taken. The
+service runtime profile, `OKX_ASP_AGENT_ID`, and venue stop-custody result are
+also not present yet, so the live engine has correctly not been started.
 
 ### Next deployment actions
 
-1. Decide/configure the service-account OKX authentication and A2A provider.
-2. Run the Day-0 venue discovery and record
+1. Keep the Agentic Wallet flow paused until the operator explicitly
+   authorizes wallet login/use for ASP identity registration.
+2. Decide/configure the service-account OKX authentication and A2A provider.
+3. Run the Day-0 venue discovery and record
    `config/runtime-profile.tradekit.yaml` (including position mode, leverage,
    fees, and stop custody).
-3. Bind the reviewed `OKX_ASP_AGENT_ID` and run the dry cycle.
-4. Install the systemd units and enable only the unit permitted by the stop
+4. Bind the reviewed `OKX_ASP_AGENT_ID` and run the dry cycle.
+5. Install the systemd units and enable only the unit permitted by the stop
    custody result; watchdog is required only for client-held stops.
-5. Obtain explicit approval before the pending system reboot, then verify SSH,
+6. Obtain explicit approval before the pending system reboot, then verify SSH,
    systemd, and the other project services after reboot.
