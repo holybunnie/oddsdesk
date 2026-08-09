@@ -398,7 +398,13 @@ Recorded in `config/runtime-profile.tradekit.yaml` (gitignored — machine-local
 
 ## 5. What is built
 
-All under `/workspaces/oddsdesk`, branch `core-risk-ledger`. 175 tests passing.
+All under `/workspaces/oddsdesk` on **`main`**. 425 tests passing.
+
+**One branch, deliberately.** Sessions 1-6 left a `core-risk-ledger` branch and
+session 7 left a `session-7-review-fixes` branch; both were fully merged
+duplicates of `main` and have been deleted. With a two-week competition and one
+operator there is nothing a second branch buys, and a stale branch that still
+looks like the place work happens is how a fix gets made twice or lost once.
 
 ### `src/config.ts` + `config/default.yaml`
 Zod-validated policy loader, strict, no default-on-missing. Policy only —
