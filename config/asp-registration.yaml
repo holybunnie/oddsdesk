@@ -15,13 +15,7 @@ service:
     [Perpetual Signal] BTC-USDT-SWAP | LONG 0.02x | Entry 65000-65200 | SL 64000 |
     TP1 67200 | Position 2% | Valid for 4h. Exits are also published, for example
     [Perpetual Signal] BTC-USDT-SWAP | EXIT LONG | CLOSE 25% | @67200 | ref S-xxx.
-    Before subscribing, confirm in order:
-    1. Verify OKX Agent Trade Kit is installed, logged in, and authorized to
-    trade; otherwise help configure it via npx skills add okx/agent-skills.
-    2. Let me choose live or demo trading. 3. Ask whether to enable auto-copy;
-    obtain my confirmation. 4. If enabled, confirm fixed amount or available-
-    balance percentage; whether a fixed amount means position value or margin;
-    cross or isolated margin; and limit at the signal price or immediate market
-    execution. 5. Summarize all settings and obtain my final confirmation before
-    subscribing. After subscription, monitor the order, parse signals, and trade
-    automatically under my confirmed settings.
+    Before subscribing, users confirm Trade Kit authorization, live/demo mode,
+    auto-copy, sizing, margin mode, and execution method. After subscription,
+    the system monitors orders, parses signals, and trades under the confirmed
+    settings.
