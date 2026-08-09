@@ -14,6 +14,10 @@
  *      means for this trade.
  *   3. **Peak equity.** The drawdown governor measures from the peak, so the
  *      peak has to outlive the process that observed it.
+ *   4. **Signals already acted on.** The copy executor deduplicates redelivered
+ *      signals, and an in-memory set loses that on restart — which is when a
+ *      redelivery is most likely, because whatever restarted us may also have
+ *      interrupted a delivery acknowledgement.
  *
  * All three survive restart. A cooldown that resets on restart is not a
  * cooldown — it is an invitation to re-enter the instrument that just stopped
@@ -57,9 +61,22 @@ interface Snapshot {
   readonly positions: readonly TrackedPosition[];
   readonly cooldowns: Readonly<Record<string, number>>;
   readonly peakEquityUsdt: number;
+  /** Signal ids already acted on, with the time they were recorded. */
+  readonly actedSignals: Readonly<Record<string, number>>;
 }
 
-const EMPTY: Snapshot = { positions: [], cooldowns: {}, peakEquityUsdt: 0 };
+const EMPTY: Snapshot = { positions: [], cooldowns: {}, peakEquityUsdt: 0, actedSignals: {} };
+
+/**
+ * How long an acted-on signal id is remembered.
+ *
+ * Unbounded growth would eventually make every restart slower and the state
+ * file larger without limit. Two weeks covers the whole competition window with
+ * room to spare, so within the only period that matters the journal is
+ * effectively permanent — the expiry exists so the file cannot grow forever in
+ * a longer-lived deployment, not as a real forgetting policy.
+ */
+const SIGNAL_MEMORY_MS = 14 * 24 * 3_600_000;
 
 /**
  * Durable engine state.
@@ -72,6 +89,7 @@ export class EngineState {
   readonly #path: string;
   #positions = new Map<string, TrackedPosition>();
   #cooldowns = new Map<string, number>();
+  #actedSignals = new Map<string, number>();
   #peakEquityUsdt = 0;
 
   constructor(path: string) {
@@ -103,6 +121,7 @@ export class EngineState {
 
     this.#positions = new Map(parsed.positions.map((p) => [p.instId, p]));
     this.#cooldowns = new Map(Object.entries(parsed.cooldowns));
+    this.#actedSignals = new Map(Object.entries(parsed.actedSignals ?? {}));
     this.#peakEquityUsdt = parsed.peakEquityUsdt;
   }
 
@@ -111,6 +130,7 @@ export class EngineState {
       positions: [...this.#positions.values()],
       cooldowns: Object.fromEntries(this.#cooldowns),
       peakEquityUsdt: this.#peakEquityUsdt,
+      actedSignals: Object.fromEntries(this.#actedSignals),
     };
     const temporary = `${this.#path}.tmp`;
     writeFileSync(temporary, JSON.stringify(snapshot, null, 2), 'utf8');
@@ -160,6 +180,27 @@ export class EngineState {
   }
 
   /**
+   * Cooldowns still in force, expired ones dropped.
+   *
+   * Returned as a map rather than a list so a caller cannot iterate the
+   * instruments without also holding the expiry it has to respect.
+   */
+  activeCooldowns(nowMs: number): ReadonlyMap<string, number> {
+    const active = new Map<string, number>();
+    let expired = false;
+    for (const [instId, until] of this.#cooldowns) {
+      if (until <= nowMs) {
+        this.#cooldowns.delete(instId);
+        expired = true;
+      } else {
+        active.set(instId, until);
+      }
+    }
+    if (expired) this.#persist();
+    return active;
+  }
+
+  /**
    * Record observed equity and return the peak.
    *
    * The peak only ever rises. Letting it fall would reset the drawdown
@@ -176,6 +217,31 @@ export class EngineState {
 
   get peakEquityUsdt(): number {
     return this.#peakEquityUsdt;
+  }
+
+  /**
+   * A durable `SignalJournal` for the copy executor.
+   *
+   * Structurally typed against `copy.ts`'s interface rather than importing it,
+   * so the execution layer keeps no dependency on engine state.
+   */
+  signalJournal(now: () => number = () => Date.now()): {
+    has(signalId: string): boolean;
+    record(signalId: string): void;
+  } {
+    return {
+      has: (signalId) => this.#actedSignals.has(signalId),
+      record: (signalId) => {
+        const nowMs = now();
+        this.#actedSignals.set(signalId, nowMs);
+        // Pruned on write, so the file cannot grow without bound and no
+        // separate sweep has to be remembered.
+        for (const [id, at] of this.#actedSignals) {
+          if (nowMs - at > SIGNAL_MEMORY_MS) this.#actedSignals.delete(id);
+        }
+        this.#persist();
+      },
+    };
   }
 }
 

@@ -6,179 +6,80 @@
  * test for the scanner: "ranking reproducible from recorded data" means being
  * able to run this and read the same numbers the engine acted on.
  *
- * Read-only. It places no orders and needs no credentials.
+ * It RENDERS the pipeline; it does not re-implement it. `runScan()` is the same
+ * function the driver calls, so this script cannot drift into reporting
+ * something the engine no longer does — which would be worse than no script.
+ *
+ * Read-only. It places no orders and needs no credentials. It is also
+ * stateless, so it passes no cooldowns and deliberately over-reports; the live
+ * engine supplies them.
  */
 
 import { loadConfig } from '../config.js';
-import { OkxMarketData, confirmedOnly, type Candle } from '../market/okx.js';
-import {
-  assessRegime,
-  rankByMomentum,
-  regimeIsFavourable,
-  selectUniverse,
-  takeExtremes,
-  type Direction,
-  type RankedInstrument,
-  type RegimeVerdict,
-} from '../signal/scanner.js';
-import { evaluateEntry } from '../signal/entry.js';
-
-/** Enough history for ADX(14), which needs roughly 2x its period plus slack. */
-const CANDLE_LIMIT = 120;
-
-/** 4h history for the multi-timeframe conviction component. */
-const HTF_CANDLE_LIMIT = 60;
-
-/** A candidate that reached the regime gate, kept with the side it was ranked for. */
-interface Assessed {
-  readonly ranked: RankedInstrument;
-  readonly direction: Direction;
-  readonly rankIndex: number;
-  readonly verdict: RegimeVerdict;
-}
+import { runScan } from '../engine/scan.js';
+import { OkxMarketData } from '../market/okx.js';
+import type { RegimeVerdict } from '../signal/scanner.js';
 
 async function main(): Promise<void> {
   const config = loadConfig('config/default.yaml');
   const market = new OkxMarketData();
 
-  const [instruments, tickers] = await Promise.all([market.instruments('SWAP'), market.tickers('SWAP')]);
+  const scan = await runScan({ config, market });
+  const { result } = scan;
 
-  const universe = selectUniverse(config, instruments, tickers);
-  console.log(`E1 universe: ${universe.length} instruments`);
-  console.log(
-    `   from ${instruments.filter((i) => i.instId.endsWith('-USDT-SWAP') && i.state === 'live').length} live USDT perps`,
-  );
+  console.log(`E1 universe: ${scan.universeSize} instruments`);
+  console.log(`   from ${scan.liveUsdtPerps} live USDT perps`);
   console.log(
     `   filters: >= $${(config.universe.minQuoteVolume24hUsdt / 1e6).toFixed(0)}M 24h volume, ` +
       `spread <= ${config.universe.maxSpreadBps}bps`,
   );
 
-  if (universe.length === 0) {
+  if (scan.universeSize === 0) {
     console.log('\nNo instruments passed E1. Nothing to rank.');
     return;
   }
 
-  // Fetch candles and funding concurrently, but in bounded batches so a
-  // 400-instrument universe cannot open 400 sockets at once.
-  const candlesByInstrument = new Map<string, readonly Candle[]>();
-  const fundingByInstrument = new Map<string, number>();
-  const BATCH = 8;
-
-  for (let i = 0; i < universe.length; i += BATCH) {
-    const batch = universe.slice(i, i + BATCH);
-    await Promise.all(
-      batch.map(async (member) => {
-        const [candles, funding] = await Promise.all([
-          market.candles(member.instId, '1H', CANDLE_LIMIT),
-          market.fundingRate(member.instId),
-        ]);
-        const closed = confirmedOnly(candles);
-        candlesByInstrument.set(member.instId, closed);
-        fundingByInstrument.set(member.instId, funding);
-      }),
-    );
-  }
-
-  // Rank first so the regime gate can be evaluated against the side each
-  // instrument is actually a candidate for.
-  const ranked = rankByMomentum(config, candlesByInstrument);
-  const extremes = takeExtremes(config, ranked);
-
-  const rankIndexOf = new Map(ranked.map((r, i) => [r.instId, i]));
-  const assessed: Assessed[] = [];
-  const verdicts: RegimeVerdict[] = [];
-  const check = (instId: string, direction: Direction): RegimeVerdict => {
-    const candles = candlesByInstrument.get(instId);
-    const funding = fundingByInstrument.get(instId);
-    if (candles === undefined || funding === undefined) {
-      throw new Error(`missing market data for ${instId}`);
-    }
-    return assessRegime(config, instId, candles, funding, direction);
-  };
-
-  console.log(`\nE3 ranking: ${ranked.length} instruments by ATR-normalised momentum`);
+  console.log(`\nE3 ranking: ${scan.ranked.length} instruments by ATR-normalised momentum`);
   console.log(`   taking the top and bottom ${(config.ranking.decileFraction * 100).toFixed(0)}%\n`);
 
-  const assess = (candidate: RankedInstrument, direction: Direction): void => {
-    const verdict = check(candidate.instId, direction);
-    const rankIndex = rankIndexOf.get(candidate.instId);
-    if (rankIndex === undefined) {
-      throw new Error(`${candidate.instId} is an extreme but carries no rank`);
-    }
-    verdicts.push(verdict);
-    assessed.push({ ranked: candidate, direction, rankIndex, verdict });
-    report(candidate.instId, candidate.momentumScore, verdict);
-  };
-
   console.log('LONG candidates (strongest momentum):');
-  for (const candidate of extremes.longs) assess(candidate, 'long');
+  for (const item of scan.assessed.filter((a) => a.direction === 'long')) {
+    report(item.ranked.instId, item.ranked.momentumScore, item.verdict);
+  }
 
   console.log('\nSHORT candidates (weakest momentum):');
-  for (const candidate of extremes.shorts) assess(candidate, 'short');
-
-  const passing = verdicts.filter((v) => v.passed).length;
-  const favourable = regimeIsFavourable(config, verdicts);
+  for (const item of scan.assessed.filter((a) => a.direction === 'short')) {
+    report(item.ranked.instId, item.ranked.momentumScore, item.verdict);
+  }
 
   console.log(
-    `\nE2 regime: ${passing}/${verdicts.length} candidates pass ` +
+    `\nE2 regime: ${scan.regimePassing}/${scan.regimeConsidered} candidates pass ` +
       `(need ${config.signals.minInstrumentsPassingRegime})`,
   );
   console.log(
-    favourable
+    result.regimeFavourable
       ? 'REGIME FAVOURABLE — the engine would look for entries among the passing candidates.'
       : 'REGIME UNFAVOURABLE — the engine stands down. Standing down is a valid output.',
   );
 
-  if (!favourable) return;
+  if (!result.regimeFavourable) return;
 
-  // E4 runs only on candidates that cleared E2. Evaluating the failures too
-  // would print entries the engine would never take, which is exactly the
-  // partial-picture-that-reads-as-complete this script must not produce.
-  const eligible = assessed.filter((a) => a.verdict.passed);
-  console.log(`\nE4 entry gate: ${eligible.length} candidates, conviction threshold ${config.signals.minConviction}\n`);
+  const eligible = scan.assessed.filter((a) => a.verdict.passed).length;
+  console.log(`\nE4 entry gate: ${eligible} candidates, conviction threshold ${config.signals.minConviction}\n`);
 
-  const nowMs = Date.now();
-  let accepted = 0;
-
-  for (const item of eligible) {
-    const candles1h = candlesByInstrument.get(item.ranked.instId);
-    if (candles1h === undefined) throw new Error(`missing 1h candles for ${item.ranked.instId}`);
-
-    const candles4h = confirmedOnly(
-      await market.candles(item.ranked.instId, '4H', HTF_CANDLE_LIMIT),
-    );
-
-    const verdict = evaluateEntry(config, {
-      ranked: item.ranked,
-      direction: item.direction,
-      candles1h,
-      candles4h,
-      volumeTrendValue: item.verdict.volumeTrend,
-      universeSize: ranked.length,
-      rankIndex: item.rankIndex,
-      nowMs,
-      // No cooldown state here: this script is stateless and holds no position
-      // history. The live engine supplies it; a scan intentionally over-reports
-      // rather than silently hiding a candidate it cannot reason about.
-    });
-
-    const symbol = item.ranked.instId.replace('-USDT-SWAP', '').padEnd(10);
-
-    if (!verdict.accepted) {
-      const score = verdict.rejection.conviction?.total;
-      console.log(
-        `  --    ${symbol} ${item.direction.padEnd(5)} ` +
-          `conviction ${score === undefined ? 'n/a' : score.toFixed(1)}`,
-      );
-      for (const reason of verdict.rejection.reasons) console.log(`         - ${reason}`);
-      continue;
-    }
-
-    accepted += 1;
-    const c = verdict.candidate;
+  for (const rejection of scan.rejected) {
+    const symbol = rejection.instId.replace('-USDT-SWAP', '').padEnd(10);
+    const score = rejection.conviction?.total;
     console.log(
-      `  ENTRY ${symbol} ${c.direction.padEnd(5)} conviction ${c.conviction.total.toFixed(1)}`,
+      `  --    ${symbol} ${rejection.direction.padEnd(5)} ` +
+        `conviction ${score === undefined ? 'n/a' : score.toFixed(1)}`,
     );
+    for (const reason of rejection.reasons) console.log(`         - ${reason}`);
+  }
+
+  for (const c of result.candidates) {
+    const symbol = c.instId.replace('-USDT-SWAP', '').padEnd(10);
+    console.log(`  ENTRY ${symbol} ${c.direction.padEnd(5)} conviction ${c.conviction.total.toFixed(1)}`);
     console.log(
       `         band ${fmt(c.entryBandLow)} - ${fmt(c.entryBandHigh)}  ` +
         `stop ${fmt(c.stopPrice)}  target ${fmt(c.targetPrice)}  ` +
@@ -193,10 +94,10 @@ async function main(): Promise<void> {
   // Frequency sanity check. The gate exists to make trading rare; a scan that
   // fires broadly is a tuning signal, not a good day.
   console.log(
-    `\n${accepted} entry signal(s) from ${eligible.length} eligible candidates. ` +
+    `\n${result.candidates.length} entry signal(s) from ${eligible} eligible candidates. ` +
       `Target is ~${config.signals.targetTradesPerDay}/day across all scans.`,
   );
-  if (accepted > config.signals.targetTradesPerDay) {
+  if (result.candidates.length > config.signals.targetTradesPerDay) {
     console.log('NOTE: more signals in one scan than the daily target — the threshold may be too loose.');
   }
 }
