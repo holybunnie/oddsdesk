@@ -1,4 +1,8 @@
-# ASP registration & competition rules — authoritative reference
+# ASP registration & competition — verified annex to the build spec
+
+> **Read [`BUILD-SPEC-v2.md`](BUILD-SPEC-v2.md) first.** It is the governing
+> document. This file is the ANNEX: exact source quotes the spec paraphrases,
+> plus §9 — the gaps in the spec found by checking it against source.
 
 **Source:** the OKX.AI Hackathon event page and
 <https://web3.okx.com/onchainos/dev-docs/okxai/a2a-subscription>
@@ -291,3 +295,117 @@ the score. No code path may request a deposit. Fund once, before registering.
 4. The FAQ contents on the event page (collapsed in what we captured).
 5. Whether the on-chain listing QA and the ~24h human review are the same gate
    or two separate ones.
+
+
+---
+
+## 9. GAPS IN THE BUILD SPEC — take these to the planning agent
+
+Found by checking `BUILD-SPEC-v2.md` against the event page, the dev-portal
+A2A-subscription doc, and the `okx-ai` registration flow. The spec is accurate
+on almost everything; these are the exceptions.
+
+### Blocks registration outright
+
+1. **The registered name is too long, in both fields.**
+   Spec Part IV: `AlphaGate — Perpetual Momentum Signals` = **38 characters**.
+   The registration flow caps the agent name at **EN 3–25** and the service name
+   at **5–30**. It fits neither. Split required:
+   - agent name → `AlphaGate` (9)
+   - service name → `Perpetual Momentum Signals` (26)
+   Safe, because `classify()` reads `serviceName + serviceTitle +
+   serviceDescription` concatenated, so the keyword still lands.
+
+2. **An avatar is mandatory and the spec never mentions one.**
+   An ASP create is rejected without `--picture`. It must be an uploaded **image
+   file ≤1 MB** — links are rejected outright and there is no default fallback
+   for the ASP role (unlike user/evaluator). Nothing in Part IV or Part XIII
+   accounts for producing one.
+
+3. **One ASP per wallet address.** If the wallet already holds an ASP identity,
+   `create` is refused and the flow forces an update of the existing one. The
+   spec assumes a clean create.
+
+### Missing infrastructure
+
+4. **Onchain OS and `okx-a2a` are not in Part XII.** The delivery daemon shells
+   out to both (`onchainos agent deliver`, `okx-a2a session create`). Part XII
+   lists Node, systemd, swap, ufw, NTP — not these. Install is
+   `npx skills add okx/onchainos-skills --yes -g`.
+
+5. **Agentic Wallet login is email + browser, on a headless box.** The reference
+   daemon's `ensure_login()` emits a login URL to complete in a browser, then
+   polls with an `authSessionId`. Part XII has no plan for doing that on
+   Lightsail, and it recurs on every JWT expiry — which is Trap 4.
+
+6. **Three systemd units on a 2 GB box, plus the Python daemon.** Part XII caps
+   them at 400M + 500M + 350M = 1.25 GB and adds 2 GB swap, but the daemon is a
+   fourth process with no cap assigned, and `delphi-agent` is an unrelated
+   project competing for the same box.
+
+### Missing integration
+
+7. **How the signal engine reaches the daemon is unspecified.** Part IV says
+   "replace the placeholder signal builders with real output from the signal
+   engine" — but the engine is TypeScript and the daemon is Python. The two
+   plausible seams are: engine writes `signals.txt` and `asp_push.py` delivers
+   it, or the engine shells `onchainos agent deliver` itself. This is the
+   `SignalPublisher` implementation and it is the last placeholder in the
+   running code.
+   Complication: Part IV mandates **scheduled**-push for the 45s heartbeat, but
+   our engine is event-driven. Likely both — `asp_autopilot.py` for heartbeat
+   and liveness, our engine for actual delivery.
+
+8. **Subscribing to our own ASP has no build task.** Part III mentions two Agent
+   sessions and "subscribe to your own ASP at `okx.ai/agents/{agentId}`", and
+   tutorial step 5 requires enabling auto copy-trading from the participating
+   ASP — but Part XIII never sequences it.
+
+9. **Competition registration is a separate step after ASP approval.** Part XIII
+   says only "register early". The real sequence is: list → ~24h review with the
+   ASP online → **approval** → *then* competition registration, binding the OKX
+   UID and funding ≥300 USDT. Two gates, not one.
+
+### Smaller corrections
+
+10. The spec's `classify()` table omits two real rows: `"option"` → `option`,
+    and `"defi" | "liquidity" | "lp"` → `defi`. Harmless for us, but the table
+    is presented as complete.
+11. The free trial is fixed at exactly **72 h**; no other length is accepted.
+    The fee must be a **quoted digits-only string** (`"15"`), never `15 USDT`.
+12. Prize depth: **4th–40th all receive $500**. Part X's endgame reasoning
+    ("6th and 20th pay identically") depends on this, but Part II never states
+    it.
+13. Rule 3.2 requires the service to stay subscribable and usable **by other
+    users**, not merely online for us.
+
+### Where our build has diverged from the spec
+
+14. **`formatSignal` does not match the spec's own canonical shape.** Spec Part
+    IV mandates
+    `[Perpetual Signal] SOL-PERP | LONG 3x | Entry 182.4-183.1 | SL 176.8 | TP1 199.2 | Position 8% | Valid for 6h`
+    We emit
+    `[Perpetual Signal] LONG BTC-USDT-SWAP entry 64700-64800 stop 64000 target 67200 size 40% id S-...`
+    Different delimiters, different labels, no leverage, no validity window, an
+    extra id, and `-USDT-SWAP` instead of `-PERP`. **This is our defect, not a
+    spec gap** — the spec was right and the implementation predates reading it.
+    Two open questions it raises:
+    - The spec's published-field list has **no signal id**, and Law 6 requires
+      traceability from *logs*, not from the text. Dropping the id frees ~24 of
+      the 200 characters — but our copy executor currently dedupes on it, so
+      dedupe would move to the delivery `jobId`.
+    - Asset naming: the spec and both official examples say `-PERP`, but Trade
+      Kit places orders against the instId `-USDT-SWAP`. Our executor can map
+      between them; a third-party subscriber's agent must too.
+
+15. **Build order was not followed.** Spec Part XIII puts the ASP at stage 2,
+    before the Trade Kit adapter at 3 — precisely because of the deadline. We
+    built 3, 5, 6, 7 and have not started 1 or 2.
+
+### Spec items in config but implemented by nothing
+
+Validated by the config schema, read by no code:
+`feeBudgetFraction` (E7), `pyramiding.*` (E6), `attribution.minRealisedPayoffRatio`
+(Part VIII step 4), `risk.haltDurationHours`. Also unbuilt: the daily operating
+procedure (Part VIII), alerting (Part XII), the health endpoint, and the
+leaderboard parser (blocked until Aug 11 by design).
