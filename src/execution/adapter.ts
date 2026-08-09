@@ -38,6 +38,8 @@ export interface Instrument {
    * size in the base asset directly and no conversion applies.
    */
   readonly contractValue: number | null;
+  /** Venue-reported leverage ceiling for this instrument, when exposed. */
+  readonly maxLeverage?: number;
 }
 
 /**

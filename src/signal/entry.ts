@@ -259,8 +259,18 @@ export function evaluateEntry(config: Config, inputs: EntryInputs): EntryVerdict
   const entryBandLow = direction === 'long' ? breakout.level : reference - bandWidth;
   const entryBandHigh = direction === 'long' ? reference + bandWidth : breakout.level;
 
+  // The order is placed at the far edge of the published band, not at the
+  // signal-time close. TP1 and TP2 must be derived from that executable price.
+  // The stop remains anchored to the confirmed close, while the wider realised
+  // risk from the band edge is used in the payoff and sizing math. Using the
+  // close for all three made E4 look 3:1 but fall below 3:1 after copy.ts placed
+  // at entryBandHigh/Low — a published-vs-placed mismatch.
+  const entryPrice = direction === 'long' ? reference + bandWidth : reference - bandWidth;
+  // Keep the original stop anchor at the confirmed close. The order may fill
+  // slightly inside the band, so the realised risk is measured from the
+  // executable edge below rather than pretending the close was the fill.
   const stopPrice = initialStopFor(config, direction, reference, atrValue);
-  const riskDistance = Math.abs(reference - stopPrice);
+  const riskDistance = Math.abs(entryPrice - stopPrice);
 
   // Carry. Expressed as a price distance so it can be added to the target: the
   // trade must clear the payoff ratio on the move NET of funding, not gross.
@@ -271,21 +281,21 @@ export function evaluateEntry(config: Config, inputs: EntryInputs): EntryVerdict
   // of budget consumed by one position, while the fee tracker reported 2 bps
   // maker and looked healthy. The cost was real and invisible in every number
   // the system produced.
-  const fundingCostDistance = reference * expectedFundingCostFraction(config, inputs.fundingRate, direction);
+  const fundingCostDistance = entryPrice * expectedFundingCostFraction(config, inputs.fundingRate, direction);
 
   // Target at the minimum acceptable payoff ratio, pushed out by the carry. If a
   // setup cannot offer it, it is not a trade — and unlike the gross version this
   // can genuinely fail to be offerable, which is the point: an expensive-to-hold
   // instrument now needs a bigger move to qualify rather than qualifying anyway.
   const targetDistance = config.risk.minTargetStopRatio * riskDistance + fundingCostDistance;
-  const targetPrice = direction === 'long' ? reference + targetDistance : reference - targetDistance;
+  const targetPrice = direction === 'long' ? entryPrice + targetDistance : entryPrice - targetDistance;
 
   // Where 25% actually comes off. E5 scales out at +2R and trails the rest, so
   // this — not the target above — is the first thing that happens to a winner,
   // and publishing the target as though it were the plan is what made the old
   // signal describe a trade we never took.
   const scaleOutDistance = config.exits.scaleOutAtR * riskDistance;
-  const scaleOutPrice = direction === 'long' ? reference + scaleOutDistance : reference - scaleOutDistance;
+  const scaleOutPrice = direction === 'long' ? entryPrice + scaleOutDistance : entryPrice - scaleOutDistance;
 
   if (scaleOutPrice <= 0) {
     return {
@@ -323,7 +333,7 @@ export function evaluateEntry(config: Config, inputs: EntryInputs): EntryVerdict
       stopPrice,
       scaleOutPrice,
       targetPrice,
-      expectedFundingCostFraction: fundingCostDistance / reference,
+      expectedFundingCostFraction: fundingCostDistance / entryPrice,
       atr: atrValue,
       conviction,
       validUntilMs: nowMs + config.entry.validityHours * 3_600_000,

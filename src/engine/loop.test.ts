@@ -109,10 +109,14 @@ class FakeCopyExecutor {
 
 class FakePublisher implements SignalPublisher {
   readonly published: string[] = [];
+  readonly statuses: string[] = [];
   fail = false;
   async publish(text: string): Promise<void> {
     if (this.fail) throw new Error('ASP delivery timed out');
     this.published.push(text);
+  }
+  async publishStatus(text: string): Promise<void> {
+    this.statuses.push(text);
   }
 }
 
@@ -194,14 +198,20 @@ describe('openRiskUsdt', () => {
     // Times an 800 stop distance = 1.92 USDT. Using the bare 800 instead reads
     // as hundreds of percent of portfolio heat and refuses every later trade.
     expect(
-      openRiskUsdt(btc, { entryPrice: 64_800, currentStop: 64_000, remainingFraction: 1, venueSize: '24' }),
+      openRiskUsdt(btc, { entryPrice: 64_800, currentStop: 64_000, remainingFraction: 1, venueSize: '24' }, 'long'),
     ).toBeCloseTo(1.92, 6);
   });
 
   it('discounts what has already been scaled out', () => {
     expect(
-      openRiskUsdt(btc, { entryPrice: 64_800, currentStop: 64_000, remainingFraction: 0.75, venueSize: '24' }),
+      openRiskUsdt(btc, { entryPrice: 64_800, currentStop: 64_000, remainingFraction: 0.75, venueSize: '24' }, 'long'),
     ).toBeCloseTo(1.44, 6);
+  });
+
+  it('counts a stop above a long entry as zero remaining downside risk', () => {
+    expect(
+      openRiskUsdt(btc, { entryPrice: 64_800, currentStop: 65_000, remainingFraction: 1, venueSize: '24' }, 'long'),
+    ).toBe(0);
   });
 });
 
@@ -285,6 +295,7 @@ describe('gates on new entries', () => {
 
     expect(report.standDownReason).toMatch(/regime unfavourable/);
     expect(publisher.published).toHaveLength(0);
+    expect(publisher.statuses).toEqual(['[Perpetual Status] regime unfavourable — the engine stands down']);
   });
 
   it('stands down when the kill switch is tripped', async () => {

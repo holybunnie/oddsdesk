@@ -180,9 +180,12 @@ signals:
   minConviction: 75
   targetTradesPerDay: 2
 
-  # Regime gate: if fewer than this many instruments pass, the regime is
-  # unfavourable and the agent stands down. Standing down is a valid output.
-  minInstrumentsPassingRegime: 3
+  # Regime gate: if fewer than this many extreme candidates pass, the regime is
+  # unfavourable and the agent stands down. E3 takes a 10% tail from each side;
+  # with the reachable universe usually below 30 instruments that is at most two
+  # candidates total. Requiring three made E2 stand down by construction rather
+  # than because the market was choppy.
+  minInstrumentsPassingRegime: 2
 
 regime:
   # E2. Capital is destroyed by failed attempts in chop, not by the one big
@@ -385,6 +388,7 @@ engineState:
 publishing:
   maxSignalChars: 200
   perpHeader: "[Perpetual Signal]"
+  statusHeader: "[Perpetual Status]"
   # Law 6: every trade originates from a published signal. The executor may act
   # only on signals that were actually delivered.
   requireSignalCorrespondence: true

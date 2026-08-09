@@ -228,6 +228,21 @@ export function formatExitSignal(config: Config, plan: ExitSignalPlan): string {
 }
 
 /**
+ * Render an operational status update. It intentionally has a different
+ * header from trade signals, so a subscriber can display stand-down state
+ * without treating it as an order instruction.
+ */
+export function formatStatus(config: Config, reason: string): string {
+  const cleanReason = reason.replace(/\s+/g, ' ').trim();
+  const prefix = `${config.publishing.statusHeader} `;
+  const available = Math.max(0, config.publishing.maxSignalChars - prefix.length);
+  const body = cleanReason.length <= available
+    ? cleanReason
+    : `${cleanReason.slice(0, Math.max(0, available - 1))}…`;
+  return `${prefix}${body}`.slice(0, config.publishing.maxSignalChars);
+}
+
+/**
  * The exit-signal gate.
  *
  * Thinner than `validateSignal` on purpose, and the asymmetry is the design.

@@ -40,6 +40,8 @@ export interface InstrumentSpec {
   readonly minSize: number;
   readonly tickSize: number;
   readonly state: string;
+  /** Venue-reported leverage ceiling for this instrument, when exposed. */
+  readonly maxLeverage?: number;
 }
 
 export interface TickerSnapshot {
@@ -106,6 +108,12 @@ export interface OkxMarketDataOptions {
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+export interface FundingPoint {
+  readonly timestampMs: number;
+  /** Signed as OKX reports it: positive means longs pay shorts. */
+  readonly fundingRate: number;
+}
+
 export class OkxMarketData {
   readonly #fetch: typeof fetch;
   readonly #base: string;
@@ -120,7 +128,10 @@ export class OkxMarketData {
     this.#fetch = options.fetchImpl ?? fetch;
     this.#base = options.baseUrl ?? OKX_BASE;
     this.#timeoutMs = options.timeoutMs ?? 10_000;
-    this.#minIntervalMs = options.minRequestIntervalMs ?? 60;
+    // OKX documents a 20-request/2-second limit for historical candles. A
+    // 120ms floor stays below that limit even when several callers queue at
+    // once; the old 60ms default could burst at ~16.7 requests/sec.
+    this.#minIntervalMs = options.minRequestIntervalMs ?? 120;
     this.#maxRetries = options.maxRetries ?? 4;
   }
 
@@ -228,6 +239,14 @@ export class OkxMarketData {
       // still throws, because sizing and rounding depend on those fields.
       if (state !== 'live') continue;
 
+      const rawLeverage = row['lever'];
+      const maxLeverage = rawLeverage === undefined || rawLeverage === ''
+        ? undefined
+        : num(rawLeverage, 'lever', context);
+      if (maxLeverage !== undefined && maxLeverage <= 0) {
+        throw new MarketDataError(`${context}: leverage ceiling must be positive, got ${maxLeverage}`);
+      }
+
       specs.push({
         instId,
         contractValue: num(row['ctVal'], 'ctVal', context),
@@ -235,6 +254,7 @@ export class OkxMarketData {
         minSize: num(row['minSz'], 'minSz', context),
         tickSize: num(row['tickSz'], 'tickSz', context),
         state,
+        ...(maxLeverage === undefined ? {} : { maxLeverage }),
       });
     }
 
@@ -275,6 +295,59 @@ export class OkxMarketData {
   }
 
   /**
+   * Historical funding rates, oldest first.
+   *
+   * The endpoint returns newest first and uses `after` as the cursor for older
+   * funding timestamps. Keeping this pagination here means a recorder cannot
+   * accidentally backtest with the current rate repeated over 90 days.
+   */
+  async fundingRateHistory(
+    instId: string,
+    fromMs: number,
+    toMs: number,
+    limit = 400,
+  ): Promise<readonly FundingPoint[]> {
+    if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || fromMs > toMs) {
+      throw new MarketDataError(`invalid funding history range ${fromMs}..${toMs} for ${instId}`);
+    }
+
+    const rows: unknown[] = [];
+    let after: number | undefined;
+    const pageSize = Math.min(Math.max(Math.trunc(limit), 1), 400);
+
+    for (;;) {
+      const page = await this.#get('/api/v5/public/funding-rate-history', {
+        instId,
+        limit: String(pageSize),
+        ...(after === undefined ? {} : { after: String(after) }),
+      });
+      if (page.length === 0) break;
+      rows.push(...page);
+
+      const last = page.at(-1) as Record<string, unknown> | undefined;
+      if (last === undefined) break;
+      const oldest = num(last['fundingTime'], 'fundingTime', `funding history ${instId}`);
+      if (oldest <= fromMs || page.length < pageSize) break;
+      if (after !== undefined && oldest >= after) {
+        throw new MarketDataError(`funding history pagination did not move backward for ${instId}`);
+      }
+      after = oldest;
+    }
+
+    return rows
+      .map((raw) => {
+        const row = raw as Record<string, unknown>;
+        const timestampMs = num(row['fundingTime'], 'fundingTime', `funding history ${instId}`);
+        return {
+          timestampMs,
+          fundingRate: num(row['fundingRate'], 'fundingRate', `funding history ${instId}`),
+        } satisfies FundingPoint;
+      })
+      .filter((point) => point.timestampMs >= fromMs && point.timestampMs <= toMs)
+      .sort((a, b) => a.timestampMs - b.timestampMs);
+  }
+
+  /**
    * Candles, oldest first.
    *
    * OKX returns newest first; this reverses so indicator code reads
@@ -288,7 +361,65 @@ export class OkxMarketData {
       limit: String(limit),
     });
 
-    const candles = rows.map((raw) => {
+    const candles = this.#parseCandles(instId, rows);
+
+    return candles.reverse();
+  }
+
+  /**
+   * Historical candles, oldest first, with explicit inclusive bounds.
+   *
+   * History is paged from newest to oldest. The caller gets a de-duplicated,
+   * chronologically ordered series suitable for recording and replay.
+   */
+  async historyCandles(
+    instId: string,
+    bar: Bar,
+    fromMs: number,
+    toMs: number,
+    limit = 300,
+  ): Promise<readonly Candle[]> {
+    if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || fromMs > toMs) {
+      throw new MarketDataError(`invalid candle history range ${fromMs}..${toMs} for ${instId}`);
+    }
+
+    const rows: unknown[] = [];
+    let after: number | undefined;
+    const pageSize = Math.min(Math.max(Math.trunc(limit), 1), 300);
+
+    for (;;) {
+      const page = await this.#get('/api/v5/market/history-candles', {
+        instId,
+        bar,
+        limit: String(pageSize),
+        ...(after === undefined ? {} : { after: String(after) }),
+      });
+      if (page.length === 0) break;
+      rows.push(...page);
+
+      const last = page.at(-1);
+      if (!Array.isArray(last)) throw new MarketDataError(`candle for ${instId} is not an array`);
+      const oldest = num(last[0], 'ts', `candle history ${instId}`);
+      if (oldest <= fromMs || page.length < pageSize) break;
+      if (after !== undefined && oldest >= after) {
+        throw new MarketDataError(`candle history pagination did not move backward for ${instId}`);
+      }
+      after = oldest;
+    }
+
+    const seen = new Set<number>();
+    return this.#parseCandles(instId, rows)
+      .filter((candle) => candle.openTimeMs >= fromMs && candle.openTimeMs <= toMs)
+      .filter((candle) => {
+        if (seen.has(candle.openTimeMs)) return false;
+        seen.add(candle.openTimeMs);
+        return true;
+      })
+      .sort((a, b) => a.openTimeMs - b.openTimeMs);
+  }
+
+  #parseCandles(instId: string, rows: readonly unknown[]): Candle[] {
+    return rows.map((raw) => {
       if (!Array.isArray(raw)) {
         throw new MarketDataError(`candle for ${instId} is not an array`);
       }
@@ -304,8 +435,6 @@ export class OkxMarketData {
         confirmed: num(raw[8], 'confirm', context) === 1,
       } satisfies Candle;
     });
-
-    return candles.reverse();
   }
 }
 

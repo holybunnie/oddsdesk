@@ -11,6 +11,7 @@ import {
   type EntryInputs,
 } from './entry.js';
 import type { RankedInstrument } from './scanner.js';
+import { buildSignal } from './publish.js';
 
 const config = loadConfig('config/default.yaml');
 const NOW = 1_760_000_000_000;
@@ -209,11 +210,12 @@ describe('evaluateEntry — acceptance', () => {
     const atrValue = atr(longBreakout1h(), config.exits.atrPeriod);
     expect(c.atr).toBeCloseTo(atrValue, 10);
 
-    const risk = c.lastClose - c.stopPrice;
-    expect(risk).toBeCloseTo(config.exits.initialStopAtrMultiple * atrValue, 10);
+    const referenceRisk = c.lastClose - c.stopPrice;
+    expect(referenceRisk).toBeCloseTo(config.exits.initialStopAtrMultiple * atrValue, 10);
 
-    const reward = c.targetPrice - c.lastClose;
-    expect(reward / risk).toBeCloseTo(config.risk.minTargetStopRatio, 10);
+    const executableRisk = c.entryBandHigh - c.stopPrice;
+    const reward = c.targetPrice - c.entryBandHigh;
+    expect(reward / executableRisk).toBeCloseTo(config.risk.minTargetStopRatio, 10);
   });
 
   it('brackets the breakout level on the correct side for a long', () => {
@@ -391,11 +393,37 @@ describe('TP1 — the level E5 actually acts on', () => {
       return;
     }
 
-    const { lastClose, stopPrice, scaleOutPrice, targetPrice } = verdict.candidate;
-    const r = Math.abs(lastClose - stopPrice);
+    const { entryBandHigh, stopPrice, scaleOutPrice, targetPrice } = verdict.candidate;
+    const r = Math.abs(entryBandHigh - stopPrice);
 
-    expect(scaleOutPrice).toBeCloseTo(lastClose + config.exits.scaleOutAtR * r, 9);
+    expect(scaleOutPrice).toBeCloseTo(entryBandHigh + config.exits.scaleOutAtR * r, 9);
     expect(scaleOutPrice).toBeLessThan(targetPrice);
-    expect(scaleOutPrice).toBeGreaterThan(lastClose);
+    expect(scaleOutPrice).toBeGreaterThan(entryBandHigh);
+  });
+});
+
+describe('entry geometry and publication', () => {
+  it('builds a publishable signal using the same band-edge payoff that sizing uses', () => {
+    const verdict = evaluateEntry(config, inputs({ fundingRate: 0 }));
+    if (!verdict.accepted) {
+      expect.unreachable('the base fixture should clear the gate');
+      return;
+    }
+    const c = verdict.candidate;
+    expect(() => buildSignal(config, {
+      signalId: 'S-TEST-BTC-L',
+      instId: c.instId,
+      direction: c.direction,
+      entryLow: c.entryBandLow,
+      entryHigh: c.entryBandHigh,
+      stopPrice: c.stopPrice,
+      scaleOutPrice: c.scaleOutPrice,
+      targetPrice: c.targetPrice,
+      sizePercent: 1,
+      validUntilMs: NOW + HOUR,
+    }, {
+      liveInstruments: new Set([c.instId]),
+      nowMs: NOW,
+    })).not.toThrow();
   });
 });

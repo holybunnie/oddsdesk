@@ -15,11 +15,9 @@
  *
  * Usage:
  *   npx tsx src/scripts/run-engine.ts            # one dry cycle, no publish
- *   npx tsx src/scripts/run-engine.ts --live     # run continuously
+ *   OKX_ASP_AGENT_ID=<your-asp-id> npx tsx src/scripts/run-engine.ts --live
  */
 
-import { readFileSync } from 'node:fs';
-import { parse as parseYaml } from 'yaml';
 import { competitionPhase, entriesPermitted, loadConfig } from '../config.js';
 import { dailyAttribution, formatAttribution } from '../attribution.js';
 import { describeCosts } from '../fees.js';
@@ -29,99 +27,43 @@ import { OkxMarketData } from '../market/okx.js';
 import { TradeKitAdapter, okxCliRunner } from '../execution/tradekit.js';
 import { GuardedExecutor } from '../execution/guarded.js';
 import { CopyExecutor } from '../execution/copy.js';
-import type { Instrument, RiskTokenGate, VenueProfile } from '../execution/adapter.js';
+import type { Instrument } from '../execution/adapter.js';
+import { ListedPerpRiskGate } from '../execution/perp-risk.js';
 import { Driver } from '../engine/driver.js';
 import { Engine, type SignalPublisher } from '../engine/loop.js';
 import { EngineState } from '../engine/state.js';
+import { A2aSignalPublisher } from '../publishing/a2a.js';
+import { writeHeartbeat } from '../ops/heartbeat.js';
+import { readRuntimeProfile } from '../ops/runtime-profile.js';
 
 const RUNTIME_PROFILE = 'config/runtime-profile.tradekit.yaml';
 const PROFILE = 'okx-sub';
+const HEARTBEAT_PATH = 'var/engine-heartbeat.json';
+const HEARTBEAT_INTERVAL_MS = 10_000;
 
 /**
  * Facts read from the runtime profile written by the Day-0 and Part IX
  * verifications. Never literals here: a hardcoded value would defeat the gate
  * from outside it, which is exactly the move the gate cannot defend against.
  */
-interface RuntimeFacts {
-  readonly stopCustody: VenueProfile['stopCustody'];
-  readonly positionMode: 'long_short_mode' | 'net_mode';
-}
-
-function readRuntimeProfile(): RuntimeFacts {
-  let raw: string;
-  try {
-    raw = readFileSync(RUNTIME_PROFILE, 'utf8');
-  } catch {
-    throw new Error(
-      `no runtime profile at ${RUNTIME_PROFILE}. Stop custody and position mode are unknown until ` +
-        'the venue has been measured. Refusing to guess either.',
-    );
-  }
-
-  const parsed = parseYaml(raw) as {
-    stops?: { custody?: unknown; killTestObserved?: unknown; rebootTestObserved?: unknown };
-    account?: { positionMode?: unknown };
-  };
-
-  const custody = parsed?.stops?.custody;
-  if (custody !== 'venue-held' && custody !== 'client-held' && custody !== 'none' && custody !== 'unverified') {
-    throw new Error(
-      `runtime profile has stops.custody ${JSON.stringify(custody)}; expected one of ` +
-        'venue-held | client-held | none | unverified.',
-    );
-  }
-
-  // A custody claim without an observed kill test is the one inconsistency that
-  // would quietly re-open everything Part IX exists to close. Someone editing
-  // the profile by hand is precisely how that happens, so it is checked.
-  if (custody !== 'unverified' && parsed.stops?.killTestObserved !== true) {
-    throw new Error(
-      `runtime profile claims stops.custody "${custody}" but killTestObserved is not true. ` +
-        'A custody value that was not observed is worse than none — it puts an unverified stop ' +
-        'mechanism in front of a leveraged book while looking verified.',
-    );
-  }
-
-  const positionMode = parsed?.account?.positionMode;
-  if (positionMode !== 'long_short_mode' && positionMode !== 'net_mode') {
-    throw new Error(
-      `runtime profile has account.positionMode ${JSON.stringify(positionMode)}; expected ` +
-        'long_short_mode | net_mode. Getting this wrong makes every order carry the wrong posSide.',
-    );
-  }
-
-  return { stopCustody: custody, positionMode };
-}
-
-/**
- * Placeholder ASP publisher.
- *
- * Throws rather than no-opping. A publisher that silently succeeds would let
- * the engine trade signals nobody ever received, which reads as a working agent
- * from every angle except the rules — exactly the failure Law 2 warns about.
- * Replace with the real ASP client before go-live.
- */
-class UnbuiltPublisher implements SignalPublisher {
-  async publish(): Promise<void> {
-    throw new Error(
-      'ASP publisher is not built. The engine must not trade a signal it cannot publish — ' +
-        'Law 6 requires the published record to exist before the order does.',
-    );
-  }
-}
-
-/** Placeholder risk-token gate. Perps on a major venue carry no token risk. */
-class PerpTokenGate implements RiskTokenGate {
-  async assertClean(): Promise<void> {
-    // USDT perpetuals on OKX are venue-listed instruments, not arbitrary
-    // tokens. The gate exists for the meme-sniper route and stays clean here.
+/** Dry mode must never fan out to real subscribers or reach the copy executor. */
+class DryRunPublisher implements SignalPublisher {
+  async publish(text: string): Promise<void> {
+    throw new Error(`dry run: signal would be published but no order will be submitted: ${text}`);
   }
 }
 
 async function main(): Promise<void> {
   const live = process.argv.includes('--live');
   const config = loadConfig('config/default.yaml');
-  const { stopCustody, positionMode } = readRuntimeProfile();
+  const { stopCustody, positionMode } = readRuntimeProfile(RUNTIME_PROFILE);
+  const aspAgentId = process.env.OKX_ASP_AGENT_ID?.trim();
+  if (live && (aspAgentId === undefined || aspAgentId === '')) {
+    throw new Error(
+      'OKX_ASP_AGENT_ID is required in --live mode. Set it to the reviewed ASP identity; ' +
+        'the A2A publisher refuses to guess which ASP should receive the signal.',
+    );
+  }
 
   const ledger = new Ledger(config.ledger.path);
   const killSwitch = new KillSwitch(config.killSwitch.path);
@@ -162,7 +104,7 @@ async function main(): Promise<void> {
     adapter,
     ledger,
     killSwitch,
-    riskGate: new PerpTokenGate(),
+    riskGate: new ListedPerpRiskGate(),
     maxFeedStalenessSeconds: config.risk.maxFeedStalenessSeconds,
   });
 
@@ -182,7 +124,9 @@ async function main(): Promise<void> {
     killSwitch,
     executor,
     copyExecutor,
-    publisher: new UnbuiltPublisher(),
+    publisher: live
+      ? new A2aSignalPublisher({ agentId: aspAgentId as string })
+      : new DryRunPublisher(),
     instruments,
     readEquity: async () => Number(await adapter.availableBalance()) / 1e8,
     // Stage 3 stays unreachable until the leaderboard parser exists. Returning
@@ -235,7 +179,17 @@ async function main(): Promise<void> {
     });
   }
 
-  const result = await driver.run();
+  const heartbeat = () => {
+    try {
+      writeHeartbeat(HEARTBEAT_PATH);
+    } catch (error) {
+      console.error(`HEARTBEAT FAILED: ${(error as Error).message}`);
+      killSwitch.trip('routeB', 'engine', `heartbeat write failed: ${(error as Error).message}`);
+    }
+  };
+  heartbeat();
+  const heartbeatTimer = setInterval(heartbeat, HEARTBEAT_INTERVAL_MS);
+  const result = await driver.run().finally(() => clearInterval(heartbeatTimer));
   console.log(`stopped after ${result.cycles} cycle(s)`);
 
   if (result.haltedBecause !== null) {

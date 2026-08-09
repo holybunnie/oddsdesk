@@ -1,0 +1,19 @@
+[Unit]
+Description=Oddsdesk client-held-stop watchdog
+Wants=network-online.target
+After=network-online.target oddsdesk-engine.service
+
+[Service]
+Type=simple
+User=oddsdesk
+WorkingDirectory=/opt/oddsdesk
+EnvironmentFile=-/etc/oddsdesk/engine.env
+ExecStart=/usr/bin/node --import tsx src/scripts/watchdog.ts
+Restart=always
+RestartSec=5
+MemoryMax=150M
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

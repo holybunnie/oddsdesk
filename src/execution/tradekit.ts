@@ -174,7 +174,7 @@ export function assertValidClientOrderId(clientOrderId: string): void {
 
 type Row = Readonly<Record<string, unknown>>;
 
-type InstrumentSpec = Pick<Instrument, 'priceDecimals' | 'sizeDecimals' | 'contractValue'>;
+type InstrumentSpec = Pick<Instrument, 'priceDecimals' | 'sizeDecimals' | 'contractValue' | 'maxLeverage'>;
 
 /** Required string field. OKX omits nothing but empties plenty, and '' is not a value. */
 function str(row: Row, key: string): string {
@@ -277,11 +277,27 @@ export class TradeKitAdapter implements ExecutionAdapter {
         throw new ExecutionError(VENUE, `${symbol} reported an unusable ctVal ${JSON.stringify(rawCtVal)}`);
       }
 
-      instruments.push({ symbol, priceDecimals, sizeDecimals, contractValue });
-      minOrderSize[symbol] = toMinorUnits(str(row, 'minSz'), sizeDecimals);
-      this.#specs.set(symbol, { priceDecimals, sizeDecimals, contractValue });
-
       const lever = optionalStr(row, 'lever');
+      const maxLeverage = lever === null ? undefined : Number(lever);
+      if (maxLeverage !== undefined && !(Number.isFinite(maxLeverage) && maxLeverage > 0)) {
+        throw new ExecutionError(VENUE, `${symbol} reported an unusable leverage ceiling ${JSON.stringify(lever)}`);
+      }
+      const instrument: Instrument = {
+        symbol,
+        priceDecimals,
+        sizeDecimals,
+        contractValue,
+        ...(maxLeverage === undefined ? {} : { maxLeverage }),
+      };
+      instruments.push(instrument);
+      minOrderSize[symbol] = toMinorUnits(str(row, 'minSz'), sizeDecimals);
+      this.#specs.set(symbol, {
+        priceDecimals,
+        sizeDecimals,
+        contractValue,
+        ...(maxLeverage === undefined ? {} : { maxLeverage }),
+      });
+
       if (lever !== null) venueMaxLeverage = Math.max(venueMaxLeverage, Number(lever));
     }
 
@@ -464,8 +480,14 @@ export class TradeKitAdapter implements ExecutionAdapter {
       const size = str(row, 'pos');
       if (Number(size) === 0) continue; // flat rows linger after a close
 
-      const { priceDecimals, sizeDecimals, contractValue } = this.#spec(symbol);
-      const instrument: Instrument = { symbol, priceDecimals, sizeDecimals, contractValue };
+      const { priceDecimals, sizeDecimals, contractValue, maxLeverage } = this.#spec(symbol);
+      const instrument: Instrument = {
+        symbol,
+        priceDecimals,
+        sizeDecimals,
+        contractValue,
+        ...(maxLeverage === undefined ? {} : { maxLeverage }),
+      };
       const posSide = optionalStr(row, 'posSide');
       const magnitude = size.startsWith('-') ? size.slice(1) : size;
       const side =

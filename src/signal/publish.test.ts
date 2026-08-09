@@ -8,6 +8,7 @@ import {
   formatExitSignal,
   formatPrice,
   formatSignal,
+  formatStatus,
   leverageFor,
   validateExitSignal,
   roundPrice,
@@ -114,6 +115,15 @@ describe('formatSignal', () => {
     );
     expect(text).toContain('SHORT');
     expect(text).not.toContain('LONG');
+  });
+});
+
+describe('formatStatus', () => {
+  it('uses a distinct operational header and respects the same character budget', () => {
+    const text = formatStatus(config, 'regime unfavourable — the engine stands down');
+    expect(text.startsWith(config.publishing.statusHeader)).toBe(true);
+    expect(text.startsWith(config.publishing.perpHeader)).toBe(false);
+    expect(text.length).toBeLessThanOrEqual(config.publishing.maxSignalChars);
   });
 });
 

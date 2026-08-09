@@ -1,0 +1,19 @@
+[Unit]
+Description=Oddsdesk AlphaGate trading engine
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=oddsdesk
+WorkingDirectory=/opt/oddsdesk
+EnvironmentFile=-/etc/oddsdesk/engine.env
+ExecStart=/usr/bin/node --import tsx src/scripts/run-engine.ts --live
+Restart=always
+RestartSec=10
+MemoryMax=400M
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

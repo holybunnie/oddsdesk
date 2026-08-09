@@ -69,6 +69,7 @@ import type { EntryCandidate } from '../signal/entry.js';
 import type { Instrument } from '../execution/adapter.js';
 import type { CopyExecutor, ExecutionOutcome } from '../execution/copy.js';
 import type { FeedFreshness, GuardedExecutor } from '../execution/guarded.js';
+import { formatStatus } from '../signal/publish.js';
 import { EngineState, trackNewPosition, withObservedPrice, type TrackedPosition } from './state.js';
 
 export class EngineError extends Error {
@@ -86,6 +87,8 @@ export class EngineError extends Error {
  */
 export interface SignalPublisher {
   publish(text: string): Promise<void>;
+  /** Optional non-trading status channel; never parsed as a trade signal. */
+  publishStatus?(text: string): Promise<void>;
 }
 
 /** What the scanner produced this cycle. Supplied by the caller so the loop stays testable. */
@@ -226,7 +229,7 @@ export class Engine {
         costs,
       } as const;
 
-      const standDown = (reason: string): CycleReport => {
+      const standDown = async (reason: string): Promise<CycleReport> => {
         ledger.append({
           action: 'refusal',
           engine: 'engine-loop',
@@ -238,6 +241,23 @@ export class Engine {
           stop: null,
           reason: `stand down: ${reason}`,
         });
+        if (this.#deps.publisher.publishStatus !== undefined) {
+          try {
+            await this.#deps.publisher.publishStatus(formatStatus(config, reason));
+          } catch (error) {
+            ledger.append({
+              action: 'alert',
+              engine: 'engine-loop',
+              venue: this.#deps.executor.venue,
+              instrument: null,
+              signal: null,
+              price: null,
+              size: null,
+              stop: null,
+              reason: `stand-down status delivery failed: ${String(error)}`,
+            });
+          }
+        }
         return { ...base, outcomes: [], signals: cycle.counts, standDownReason: reason };
       };
 
@@ -250,7 +270,7 @@ export class Engine {
       //    Every other gate here is about whether a trade is wise. This one is
       //    about whether it is permitted to exist.
       if (!entriesPermitted(phase)) {
-        return standDown(
+        return await standDown(
           phase === 'before'
             ? `competition has not started (opens ${new Date(config.competition.startsAt).toISOString()})`
             : phase === 'after'
@@ -264,20 +284,20 @@ export class Engine {
       // positions, so the response to spending the budget is to stop taking
       // them, not to abandon the ones already paid for.
       if (costs.breached) {
-        return standDown(`fee budget spent: ${describeCosts(costs)}`);
+        return await standDown(`fee budget spent: ${describeCosts(costs)}`);
       }
       if (governor === 'stopForCompetition') {
-        return standDown('governor has stopped trading for the competition');
+        return await standDown('governor has stopped trading for the competition');
       }
       if (governor === 'flatAndHalt') {
         await this.#flattenAll('governor flatAndHalt');
-        return standDown('governor requires flat and halt');
+        return await standDown('governor requires flat and halt');
       }
       if (this.#tripped()) {
-        return standDown('kill switch is tripped for routeB');
+        return await standDown('kill switch is tripped for routeB');
       }
       if (!scan.regimeFavourable) {
-        return standDown('regime unfavourable — the engine stands down');
+        return await standDown('regime unfavourable — the engine stands down');
       }
 
       const outcomes = await this.#takeEntries(scan, equity, stage, cycle, nowMs);
@@ -675,6 +695,7 @@ export class Engine {
 
       let sizePercent: number;
       try {
+        const instrument = this.#instrument(candidate.instId);
         const sized = computeSize(config, {
           stage,
           equity,
@@ -684,6 +705,7 @@ export class Engine {
           stopPrice,
           targetPrice: candidate.targetPrice,
           side: candidate.direction,
+          ...(instrument.maxLeverage === undefined ? {} : { instrumentMaxLeverage: instrument.maxLeverage }),
           ...(addIndex === undefined ? {} : { pyramidAddIndex: addIndex }),
         });
         // The governor is NOT applied again here. computeSize already halves
@@ -828,7 +850,7 @@ export class Engine {
         // Added to the running heat so the NEXT candidate in this same cycle is
         // sized against a book that includes this position. Without it, three
         // candidates in one cycle would each be sized as though flat.
-        openRisk.push({
+          openRisk.push({
           instrument: candidate.instId,
           correlationGroup: correlationGroupFor(config, candidate.instId),
           side: candidate.direction,
@@ -837,7 +859,7 @@ export class Engine {
             currentStop: plan.stopPrice,
             remainingFraction: 1,
             venueSize: outcome.size.toString(),
-          }),
+          }, candidate.direction),
         });
       }
     }
@@ -866,11 +888,18 @@ export class Engine {
  */
 export function openRiskUsdt(
   instrument: Instrument,
-  position: { entryPrice: number; currentStop: number; remainingFraction: number; venueSize: string },
+  position: { entryPrice: number; currentStop: number; remainingFraction: number; venueSize: string; side?: 'long' | 'short' },
+  side = position.side,
 ): number {
   const coins =
     (Number(BigInt(position.venueSize)) / 10 ** instrument.sizeDecimals) * (instrument.contractValue ?? 1);
-  return Math.abs(position.entryPrice - position.currentStop) * coins * position.remainingFraction;
+  if (side === undefined) {
+    throw new EngineError('openRiskUsdt requires a position side to measure directional risk');
+  }
+  const distance = side === 'long'
+    ? Math.max(0, position.entryPrice - position.currentStop)
+    : Math.max(0, position.currentStop - position.entryPrice);
+  return distance * coins * position.remainingFraction;
 }
 
 /**

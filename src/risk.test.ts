@@ -183,6 +183,12 @@ describe('leverage is an output, not an input', () => {
       /leverage against a 5x cap/,
     );
   });
+
+  it('honours a measured per-instrument leverage ceiling below policy cap', () => {
+    expect(() => computeSize(config, request({ instrumentMaxLeverage: 1.5, targetPrice: 105 }))).toThrow(
+      /against a 1.5x cap/,
+    );
+  });
 });
 
 describe('portfolio heat and correlation caps', () => {

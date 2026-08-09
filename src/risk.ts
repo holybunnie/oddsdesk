@@ -123,6 +123,8 @@ export interface SizingRequest {
   /** Target price in quote units. Mandatory — the >=3:1 test needs it. */
   readonly targetPrice: number;
   readonly side: 'long' | 'short';
+  /** Measured per-instrument ceiling; the policy cap is still mandatory. */
+  readonly instrumentMaxLeverage?: number;
   /**
    * Which rung of the pyramid ladder this is, or undefined for a fresh entry.
    *
@@ -303,7 +305,17 @@ export function computeSize(config: Config, request: SizingRequest): SizingResul
   // calculation — a stop placed a hair from entry produces enormous size at
   // identical nominal risk, and that is precisely what the cap is for.
   const leverage = notionalUsdt / equity.equityUsdt;
-  const maxLeverage = requireMaxLeverage(config);
+  const policyMaxLeverage = requireMaxLeverage(config);
+  if (
+    request.instrumentMaxLeverage !== undefined &&
+    (!Number.isFinite(request.instrumentMaxLeverage) || request.instrumentMaxLeverage <= 0)
+  ) {
+    throw new RiskRefusal(
+      'instrument_leverage_unknown',
+      `instrument max leverage must be positive and finite, got ${request.instrumentMaxLeverage}`,
+    );
+  }
+  const maxLeverage = Math.min(policyMaxLeverage, request.instrumentMaxLeverage ?? Number.POSITIVE_INFINITY);
   if (leverage > maxLeverage) {
     throw new RiskRefusal(
       'leverage_cap',

@@ -403,11 +403,17 @@ export class CopyExecutor {
     // published, which chasing with a market order would.
     const limitPrice = parsed.direction === 'long' ? parsed.entryHigh : parsed.entryLow;
 
+    const instrumentMaxLeverage = instrument.maxLeverage;
+    const effectiveMaxLeverage = Math.min(
+      maxLeverage,
+      instrumentMaxLeverage ?? Number.POSITIVE_INFINITY,
+    );
     const notionalUsdt = equityUsdt * (parsed.sizePercent / 100);
     const leverage = notionalUsdt / equityUsdt;
-    if (leverage > maxLeverage) {
+    if (leverage > effectiveMaxLeverage) {
       return refuse(
-        `published size ${parsed.sizePercent}% implies ${leverage.toFixed(2)}x, over the ${maxLeverage}x cap`,
+        `published size ${parsed.sizePercent}% implies ${leverage.toFixed(2)}x, over the ` +
+          `${effectiveMaxLeverage}x cap${instrumentMaxLeverage === undefined ? '' : ` for ${parsed.instId}`}`,
       );
     }
 

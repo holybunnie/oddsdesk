@@ -948,3 +948,47 @@ Aug 10 midday UTC+8** — which makes deployment, not code, the binding constrai
   under v2, the signal source — if it stops publishing, trading stops.
 - **Strategy freezes the day before go-live.** After that the only levers are
   risk fraction, engine on/off, and stage.
+
+## 10. Session pause — Lightsail SSH access
+
+The operator has a Lightsail VPS and is logged in as `ubuntu`. A dedicated
+Ed25519 key pair was generated for this workspace:
+
+- Private key: `.tmp/lightsail-codex-ed25519` (mode `600`, git-ignored; never
+  paste or transmit it)
+- Public-key fingerprint:
+  `SHA256:hsccVAjCIt6VpnVZg2zqhGfN1PH+T65o/zOJMJIfJYQ`
+- Public-key comment: `codex-oddsdesk-lightsail`
+
+The Lightsail browser terminal wrapped the long public key during paste. The
+VPS `~/.ssh/authorized_keys` currently contains malformed fragments at least
+on lines 10, 13, and 15; there is not yet a confirmed valid key entry. The
+operator also pasted the shell prompt text once, producing harmless
+`command not found` messages.
+
+No reboot is needed to activate an SSH key. Do not reboot until a new SSH
+connection using this key has been verified; the pending `libc6`/kernel reboot
+is a later operations step and must not risk access to the other projects on
+the VPS.
+
+### Resume procedure
+
+On the VPS, paste only the following short commands, one at a time (never the
+`ubuntu@...$` prompt):
+
+```bash
+t='ssh-ed25519'
+p1='AAAAC3NzaC1lZDI1NTE5'
+p2='AAAAINoWB4frsmJbgaQdM'
+p3='nQsgPtraQ0+PYP0SEbmes'
+p4='65T42D'
+c='codex-oddsdesk-lightsail'
+printf '%s %s%s%s%s %s\n' "$t" "$p1" "$p2" "$p3" "$p4" "$c" >> ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys
+grep -n '^ssh-ed25519.*codex-oddsdesk' ~/.ssh/authorized_keys
+```
+
+The verification output must contain one complete line beginning with
+`ssh-ed25519`. Existing authorized keys must be preserved. After that, obtain
+the VPS public IPv4/DNS name and test SSH from this workspace using the local
+private key. Only then perform the system reboot and continue deployment.

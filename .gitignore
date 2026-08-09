@@ -1,5 +1,6 @@
 node_modules/
 dist/
+.tmp/
 *.log
 
 # Secrets — never commit. Law: no secrets in source, from commit one.

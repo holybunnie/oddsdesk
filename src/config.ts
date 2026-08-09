@@ -307,6 +307,7 @@ export const configSchema = z
       .object({
         maxSignalChars: z.number().int().positive(),
         perpHeader: z.string().min(1),
+        statusHeader: z.string().min(1),
         requireSignalCorrespondence: z.boolean(),
         /**
          * Whether exit actions are published as signals of their own.
@@ -317,7 +318,10 @@ export const configSchema = z
          */
         publishExits: z.boolean(),
       })
-      .strict(),
+      .strict()
+      .refine((publishing) => publishing.statusHeader !== publishing.perpHeader, {
+        message: 'statusHeader must be distinct from perpHeader',
+      }),
   })
   .strict();
 

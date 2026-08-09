@@ -185,7 +185,7 @@ describe('describeVenue', () => {
     const profile = await makeAdapter(makeCli()).describeVenue();
 
     expect(profile.instruments).toEqual([
-      { symbol: 'BTC-USDT-SWAP', priceDecimals: 1, sizeDecimals: 2, contractValue: 0.01 },
+      { symbol: 'BTC-USDT-SWAP', priceDecimals: 1, sizeDecimals: 2, contractValue: 0.01, maxLeverage: 100 },
     ]);
     expect(profile.minOrderSize['BTC-USDT-SWAP']).toBe(1n);
     expect(profile.venue).toBe('okx-tradekit');
