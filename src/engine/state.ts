@@ -55,6 +55,15 @@ export interface TrackedPosition extends PositionState {
    * kill switch — which is why it is the submitted size, not a derived one.
    */
   readonly venueSize: string;
+  /**
+   * How many pyramid adds this position carries. 0 for an unadded position.
+   *
+   * On the position rather than derived from the ledger because it gates the
+   * NEXT add, and a count that reset on restart would let the ladder run past
+   * `maxAdds` — turning decreasing adds into unlimited ones, which is the
+   * failure E6's whole shape exists to prevent.
+   */
+  readonly adds: number;
 }
 
 interface Snapshot {
@@ -341,5 +350,6 @@ export function trackNewPosition(input: {
     highWaterPrice: input.entryPrice,
     lowWaterPrice: input.entryPrice,
     venueSize: input.venueSize.toString(),
+    adds: 0,
   };
 }

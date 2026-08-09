@@ -26,6 +26,7 @@ const trade = (rMultiple: number, instrument = 'BTC-USDT-SWAP'): ClosedTrade => 
   signalId: 'S-1',
   rMultiple,
   closedAtMs: 0,
+  heldHours: 10,
 });
 
 /** Enough trades to clear payoffRatioMinTrades, at a chosen win/loss shape. */
@@ -45,7 +46,7 @@ function close(rMultiple: number, terminal: boolean, instrument = 'BTC-USDT-SWAP
     size: '24',
     stop: '95',
     reason: terminal ? 'full: stop hit' : 'partial: scale-out',
-    detail: { rMultiple, terminal, fraction: terminal ? 1 : 0.25 },
+    detail: { rMultiple, terminal, fraction: terminal ? 1 : 0.25, heldHours: 10 },
   });
 }
 
@@ -149,10 +150,36 @@ describe('the realised payoff ratio', () => {
     expect(result.verdict).toMatch(/not computable/);
   });
 
-  it('counts a flat trade as a loss, because a scratch is not a win', () => {
-    const result = attribute(config, [trade(0), trade(1)]);
+  it('excludes a breakeven scratch from BOTH sides', () => {
+    // Counting it as a zero-magnitude loss drags averageRLost down and inflates
+    // the ratio: losses of [-1.0, 0.0] average 0.5, which makes a system with
+    // breakeven scratches look twice as good as one without.
+    const result = attribute(config, [trade(0), trade(1), trade(-1)]);
+
+    expect(result.scratches).toBe(1);
     expect(result.wins).toBe(1);
     expect(result.losses).toBe(1);
+    expect(result.averageRLost).toBeCloseTo(1, 9);
+    expect(result.realisedPayoffRatio).toBeCloseTo(1, 9);
+  });
+
+  it('keeps a scratch out of the hit-rate denominator too', () => {
+    // A hit rate that counted scratches would fall every time the breakeven
+    // stop did exactly what it was designed to do.
+    expect(attribute(config, [trade(3), trade(-1), trade(0)]).hitRate).toBeCloseTo(0.5, 9);
+  });
+
+  it('reports hold times against the target band without calling them violations', () => {
+    // 4-36h is where both Alpha Arena winners sat. It is a diagnostic, not a
+    // rule, and nothing in E5 forces an exit at either end.
+    const result = attribute(config, [
+      { ...trade(1), heldHours: 2 },
+      { ...trade(1), heldHours: 10 },
+      { ...trade(-1), heldHours: 50 },
+    ]);
+
+    expect(result.holdHours.median).toBeCloseTo(10, 9);
+    expect(result.holdHours.outsideBand).toBe(2);
   });
 
   it('passes a healthy system', () => {

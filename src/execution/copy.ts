@@ -64,6 +64,8 @@ export interface ParsedSignal {
   readonly sizePercent: number;
   /** Absolute expiry, read from the text rather than inferred from delivery. */
   readonly validUntilMs: number;
+  /** Set when the signal declares itself a pyramid add. */
+  readonly addIndex: number | null;
 }
 
 /**
@@ -73,7 +75,7 @@ export interface ParsedSignal {
  * make impossible.
  */
 const SIGNAL_PATTERN =
-  /^(\S+) \| (LONG|SHORT) (\d+(?:\.\d+)?)x \| Entry (\d+(?:\.\d+)?)-(\d+(?:\.\d+)?) \| SL (\d+(?:\.\d+)?) \| TP1 (\d+(?:\.\d+)?) \| TP2 (\d+(?:\.\d+)?) \| Position (\d+(?:\.\d+)?)% \| Valid (\S+) \| (\S+)$/;
+  /^(\S+) \| (LONG|SHORT) (\d+(?:\.\d+)?)x \| Entry (\d+(?:\.\d+)?)-(\d+(?:\.\d+)?) \| SL (\d+(?:\.\d+)?) \| TP1 (\d+(?:\.\d+)?) \| TP2 (\d+(?:\.\d+)?) \| Position (\d+(?:\.\d+)?)% \| Valid (\S+) \| (?:ADD (\d+) \| )?(\S+)$/;
 
 /** Parse a published entry signal. Throws rather than returning a partial reading. */
 export function parseSignal(config: Config, text: string): ParsedSignal {
@@ -102,6 +104,7 @@ export function parseSignal(config: Config, text: string): ParsedSignal {
     targetPrice,
     sizePercent,
     validUntil,
+    addIndex,
     signalId,
   ] = match as unknown as readonly string[];
 
@@ -122,6 +125,7 @@ export function parseSignal(config: Config, text: string): ParsedSignal {
     targetPrice: Number(targetPrice),
     sizePercent: Number(sizePercent),
     validUntilMs,
+    addIndex: addIndex === undefined ? null : Number(addIndex),
   };
 
   // Leverage and size are the same quantity published twice. They agreed when
@@ -372,12 +376,22 @@ export class CopyExecutor {
     }
 
     const positions = await this.#account.openPositions();
-    if (positions.some((p) => p.instrument.symbol === parsed.instId)) {
-      // Pyramiding is an engine decision expressed as a new signal with its own
-      // sizing, never something the executor infers from a second delivery.
+    const alreadyHeld = positions.some((p) => p.instrument.symbol === parsed.instId);
+
+    // Pyramiding is an engine decision, expressed as a signal that SAYS it is an
+    // add. The executor still forms no opinion: it reads the marker or it
+    // refuses. Without the marker, a second delivery on a held instrument is
+    // indistinguishable from a redelivery, and treating it as an add would let
+    // a retry double the position.
+    if (alreadyHeld && parsed.addIndex === null) {
       return refuse(`already holding ${parsed.instId}; the executor does not add to a position`);
     }
-    if (positions.length >= this.#config.risk.maxConcurrentPositions) {
+    if (!alreadyHeld && parsed.addIndex !== null) {
+      return refuse(
+        `signal declares itself add ${parsed.addIndex} but no ${parsed.instId} position is open`,
+      );
+    }
+    if (!alreadyHeld && positions.length >= this.#config.risk.maxConcurrentPositions) {
       return refuse(
         `already holding ${positions.length} positions, at the ${this.#config.risk.maxConcurrentPositions} limit`,
       );

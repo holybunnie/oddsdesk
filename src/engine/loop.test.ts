@@ -897,3 +897,142 @@ describe('E7 — the fee budget', () => {
     expect(closes[0]?.detail?.['rMultiple']).toBeCloseTo(-2, 6);
   });
 });
+
+describe('E6 — pyramiding through the whole cycle', () => {
+  /** A BTC long at +3R with its stop at breakeven: armed for an add. */
+  const armed = (state: EngineState) => {
+    state.open(
+      trackNewPosition({
+        instId: btc.symbol,
+        signalId: 'S-260812080000-BTC-L',
+        side: 'long',
+        entryPrice: 64_000,
+        initialStop: 63_000,
+        openedAtMs: NOW - 3_600_000,
+        venueSize: 24n,
+      }),
+    );
+    const held = state.position(btc.symbol);
+    if (held === undefined) throw new Error('setup failed');
+    state.update({ ...held, currentStop: 64_000, scaledOut: true, highWaterPrice: 67_000 });
+  };
+
+  /** Stage 2 needs equity at 2x the 320 Principal Base. */
+  const stage2 = { equity: 700 };
+
+  it('publishes an add as a signal that SAYS it is an add', async () => {
+    // "Add to the BTC long you already have" is a different instruction from
+    // "open a BTC long". A service publishing them identically would have half
+    // its subscribers doing the wrong one.
+    const { engine, state, publisher } = build(stage2);
+    armed(state);
+
+    await engine.runCycle(
+      scanOf([candidate({ entryBandHigh: 67_000, entryBandLow: 66_900, stopPrice: 66_000, scaleOutPrice: 69_000, targetPrice: 71_000 })], {
+        lastPrices: new Map([[btc.symbol, 67_000]]),
+      }),
+    );
+
+    const entry = publisher.published.find((t) => !t.includes('EXIT'));
+    expect(entry).toContain('ADD 1');
+  });
+
+  it('sizes the add off the STACK-WIDE stop, never a fresh one', async () => {
+    // A new 2xATR stop below the existing one would widen risk across the whole
+    // stack — the move ratchetStop exists to make impossible everywhere else.
+    const { engine, state, publisher } = build(stage2);
+    armed(state);
+
+    await engine.runCycle(
+      scanOf([candidate({ entryBandHigh: 67_000, entryBandLow: 66_900, stopPrice: 66_000, scaleOutPrice: 69_000, targetPrice: 71_000 })], {
+        lastPrices: new Map([[btc.symbol, 67_000]]),
+      }),
+    );
+
+    // E5 runs before entries, so by the time the add is sized the stack stop
+    // has already trailed from breakeven (64000) to the Chandelier level
+    // (67000 - 3 x 400 = 65800). The add inherits THAT, not the candidate's own
+    // fresh 66000 stop — which sits below it and would widen the stack's risk.
+    const entry = publisher.published.find((t) => !t.includes('EXIT')) ?? '';
+    expect(entry).toContain('SL 65800');
+    expect(entry).not.toContain('SL 66000');
+  });
+
+  it('counts the add on the position, so the ladder cannot run past maxAdds', async () => {
+    const { engine, state } = build(stage2);
+    armed(state);
+    const scan = scanOf(
+      [candidate({ entryBandHigh: 67_000, entryBandLow: 66_900, stopPrice: 66_000, scaleOutPrice: 69_000, targetPrice: 71_000 })],
+      { lastPrices: new Map([[btc.symbol, 67_000]]) },
+    );
+
+    await engine.runCycle(scan);
+    expect(state.position(btc.symbol)?.adds).toBe(1);
+
+    await engine.runCycle(scan);
+    expect(state.position(btc.symbol)?.adds).toBe(2);
+
+    // Third attempt is past the limit.
+    const report = await engine.runCycle(scan);
+    expect(state.position(btc.symbol)?.adds).toBe(2);
+    expect(reasonOf(report.outcomes[0])).toMatch(/at the 2 limit/);
+  });
+
+  it('grows the tracked venue size rather than opening a second position', async () => {
+    const { engine, state } = build(stage2);
+    armed(state);
+
+    await engine.runCycle(
+      scanOf([candidate({ entryBandHigh: 67_000, entryBandLow: 66_900, stopPrice: 66_000, scaleOutPrice: 69_000, targetPrice: 71_000 })], {
+        lastPrices: new Map([[btc.symbol, 67_000]]),
+      }),
+    );
+
+    expect(state.positions()).toHaveLength(1);
+    expect(BigInt(state.position(btc.symbol)?.venueSize ?? '0')).toBeGreaterThan(24n);
+  });
+
+  it('refuses the add in stage 1, and says why', async () => {
+    // Stage 1 is survival. Equity below 2x start keeps it there.
+    const { engine, state, publisher } = build({ equity: 400 });
+    armed(state);
+
+    const report = await engine.runCycle(
+      scanOf([candidate({ entryBandHigh: 67_000, entryBandLow: 66_900, stopPrice: 66_000, scaleOutPrice: 69_000, targetPrice: 71_000 })], {
+        lastPrices: new Map([[btc.symbol, 67_000]]),
+      }),
+    );
+
+    expect(publisher.published.filter((t) => !t.includes('EXIT'))).toHaveLength(0);
+    expect(reasonOf(report.outcomes[0])).toMatch(/pyramid not armed/);
+  });
+
+  it('never opens the opposite side on an instrument it already holds', async () => {
+    const { engine, state, publisher } = build(stage2);
+    armed(state);
+
+    const report = await engine.runCycle(
+      scanOf(
+        [
+          candidate({
+            direction: 'short',
+            entryBandLow: 66_900,
+            entryBandHigh: 67_000,
+            stopPrice: 68_000,
+            scaleOutPrice: 64_800,
+            targetPrice: 64_000,
+          }),
+        ],
+        { lastPrices: new Map([[btc.symbol, 67_000]]) },
+      ),
+    );
+
+    expect(publisher.published.filter((t) => !t.includes('EXIT'))).toHaveLength(0);
+    expect(reasonOf(report.outcomes[0])).toMatch(/refusing to open the opposite side/);
+  });
+});
+
+/** The refusal reason, when the outcome carries one. */
+function reasonOf(outcome: ExecutionOutcome | undefined): string {
+  return outcome !== undefined && outcome.status === 'refused' ? outcome.reason : '';
+}

@@ -123,6 +123,15 @@ export interface SizingRequest {
   /** Target price in quote units. Mandatory — the >=3:1 test needs it. */
   readonly targetPrice: number;
   readonly side: 'long' | 'short';
+  /**
+   * Which rung of the pyramid ladder this is, or undefined for a fresh entry.
+   *
+   * Note what this is NOT: a multiplier. The caller declares WHICH add it is
+   * and policy decides how big that add may be, so there is still no path by
+   * which a caller chooses its own size. Law 9 survives — `computeSize` keeps
+   * its arity of two, and a test asserts it.
+   */
+  readonly pyramidAddIndex?: number;
 }
 
 export interface SizingResult {
@@ -206,7 +215,12 @@ export function computeSize(config: Config, request: SizingRequest): SizingResul
   // Position count and correlation limits. Crypto perps correlate around 0.8,
   // so three longs is one trade wearing three hats — these caps are what stop a
   // "diversified" book being a single concentrated bet.
-  if (openRisk.length >= config.risk.maxConcurrentPositions) {
+  // An add is not a new position — it is more of one that already counts
+  // against every cap below. Re-applying them would make the second add
+  // impossible for the arithmetic reason that the first one succeeded.
+  const isAdd = (request.pyramidAddIndex ?? 0) > 0;
+
+  if (!isAdd && openRisk.length >= config.risk.maxConcurrentPositions) {
     throw new RiskRefusal(
       'max_positions',
       `already holding ${openRisk.length} positions (limit ${config.risk.maxConcurrentPositions})`,
@@ -214,7 +228,7 @@ export function computeSize(config: Config, request: SizingRequest): SizingResul
   }
 
   const inGroup = openRisk.filter((p) => p.correlationGroup === correlationGroup).length;
-  if (inGroup >= config.risk.maxPositionsPerCorrelationGroup) {
+  if (!isAdd && inGroup >= config.risk.maxPositionsPerCorrelationGroup) {
     throw new RiskRefusal(
       'correlation_group',
       `already holding ${inGroup} positions in correlation group "${correlationGroup}" ` +
@@ -228,7 +242,7 @@ export function computeSize(config: Config, request: SizingRequest): SizingResul
   // book that satisfies every group cap can still be a single bet placed three
   // times, which is exactly the shape that empties an account in a reversal.
   const sameSide = openRisk.filter((p) => p.side === side).length;
-  if (sameSide >= config.risk.maxPositionsPerSide) {
+  if (!isAdd && sameSide >= config.risk.maxPositionsPerSide) {
     throw new RiskRefusal(
       'directional_cap',
       `already holding ${sameSide} ${side} positions (limit ${config.risk.maxPositionsPerSide}) — ` +
@@ -237,7 +251,33 @@ export function computeSize(config: Config, request: SizingRequest): SizingResul
   }
 
   const baseFraction = riskFractionForStage(config, stage);
-  const riskFraction = governor === 'halveSizing' ? baseFraction / 2 : baseFraction;
+  const governed = governor === 'halveSizing' ? baseFraction / 2 : baseFraction;
+
+  // E6. The ladder multiple comes from POLICY, indexed by which add this is —
+  // the caller says "this is add 2", never "size this at 0.6". Index 0 of the
+  // ladder is the initial entry, so a fresh entry multiplies by 1.0 and the
+  // arithmetic below is unchanged for every non-pyramid trade.
+  const addIndex = request.pyramidAddIndex ?? 0;
+  if (addIndex > 0) {
+    if (!config.pyramiding.enabled) {
+      throw new RiskRefusal('pyramiding_disabled', 'pyramiding is disabled — refusing to size an add');
+    }
+    if (stage !== 2) {
+      throw new RiskRefusal('pyramid_stage', `pyramiding arms only in stage 2, not stage ${stage}`);
+    }
+    if (addIndex > config.pyramiding.maxAdds) {
+      throw new RiskRefusal(
+        'pyramid_max_adds',
+        `add ${addIndex} exceeds the ${config.pyramiding.maxAdds}-add limit`,
+      );
+    }
+  }
+  const ladderMultiple = config.pyramiding.addSizeMultiples[addIndex];
+  if (ladderMultiple === undefined) {
+    throw new RiskRefusal('pyramid_ladder', `no size multiple defined for rung ${addIndex}`);
+  }
+
+  const riskFraction = governed * ladderMultiple;
 
   const riskUsdt = equity.equityUsdt * riskFraction;
   if (riskUsdt <= 0) {

@@ -55,6 +55,17 @@ export interface SignalPlan {
   /** Position size as a percentage of equity, e.g. 2.5 for 2.5%. */
   readonly sizePercent: number;
   readonly validUntilMs: number;
+  /**
+   * Which pyramid rung this signal is, if any. Absent for a fresh entry.
+   *
+   * PUBLISHED, not inferred. The copy executor refuses to add to a position it
+   * already holds — that refusal is what stops a redelivered signal doubling a
+   * position — so an add has to say so in the text. Which is also the honest
+   * thing for a subscriber: "add to the SOL long you already have" is a
+   * different instruction from "open a SOL long", and a service that published
+   * them identically would have half its subscribers doing the wrong one.
+   */
+  readonly addIndex?: number;
 }
 
 /**
@@ -173,7 +184,8 @@ export function formatSignal(config: Config, plan: SignalPlan): string {
     `Entry ${formatPrice(p.entryLow)}-${formatPrice(p.entryHigh)} | ` +
     `SL ${formatPrice(p.stopPrice)} | ` +
     `TP1 ${formatPrice(p.scaleOutPrice)} | TP2 ${formatPrice(p.targetPrice)} | ` +
-    `Position ${p.sizePercent}% | Valid ${formatInstant(p.validUntilMs)} | ${p.signalId}`
+    `Position ${p.sizePercent}% | Valid ${formatInstant(p.validUntilMs)} | ` +
+    `${p.addIndex === undefined ? '' : `ADD ${p.addIndex} | `}${p.signalId}`
   );
 }
 
@@ -395,6 +407,14 @@ export function validateSignal(
   // format strings producing a signal whose stated leverage contradicts its
   // stated position size — the exact published-vs-placed divergence Law 6 exists
   // to make impossible.
+  if (p.addIndex !== undefined) {
+    if (!Number.isInteger(p.addIndex) || p.addIndex < 1) {
+      reasons.push(`add index ${p.addIndex} must be a positive integer`);
+    } else if (!text.includes(`ADD ${p.addIndex}`)) {
+      reasons.push(`text does not state that this is add ${p.addIndex} of a pyramid`);
+    }
+  }
+
   const leverage = leverageFor(p.sizePercent);
   if (!text.includes(`${leverage}x`)) {
     reasons.push(`text does not state the emergent leverage ${leverage}x implied by ${p.sizePercent}%`);

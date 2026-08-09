@@ -62,6 +62,7 @@ import {
   type ExitSignalPlan,
   type SignalPlan,
 } from '../signal/publish.js';
+import { evaluatePyramid } from '../signal/pyramid.js';
 import { baseSymbol } from '../signal/scanner.js';
 import { evaluateExit, type ExitPlan, type MarketState } from '../signal/exits.js';
 import type { EntryCandidate } from '../signal/entry.js';
@@ -416,7 +417,13 @@ export class Engine {
             // R is what Part VIII measures. Recorded numerically here because
             // parsing it back out of the reason string would make the daily
             // attribution depend on prose.
-            detail: { rMultiple: plan.rMultiple, fraction: advanced.remainingFraction, terminal: true },
+            detail: {
+              rMultiple: plan.rMultiple,
+              fraction: advanced.remainingFraction,
+              terminal: true,
+              heldHours: (nowMs - advanced.openedAtMs) / 3_600_000,
+              adds: advanced.adds,
+            },
           });
           await this.#publishExit(advanced, nowMs, lastPrice, action.reason, 'C', {
             kind: 'close',
@@ -587,6 +594,59 @@ export class Engine {
     const ordered = [...scan.candidates].sort((a, b) => b.conviction.total - a.conviction.total);
 
     for (const candidate of ordered) {
+      // E6. A candidate on an instrument we already hold is not a new position —
+      // it is a pyramid add, or it is nothing. Deciding this here rather than
+      // letting it fall through to sizing is what stops a fresh breakout on a
+      // held instrument being opened twice.
+      const held = state.position(candidate.instId);
+      let addIndex: number | undefined;
+
+      if (held !== undefined) {
+        if (held.side !== candidate.direction) {
+          outcomes.push({
+            status: 'refused',
+            signalId: null,
+            reason: `${candidate.instId} is held ${held.side}; refusing to open the opposite side`,
+          });
+          continue;
+        }
+
+        const lastPrice = scan.lastPrices.get(candidate.instId);
+        const verdict =
+          lastPrice === undefined
+            ? { armed: false, addIndex: 0, sizeMultiple: 0, reasons: ['no price to evaluate the add'] }
+            : evaluatePyramid(config, {
+                stage,
+                position: held,
+                lastPrice,
+                // The breakout that produced this candidate IS the fresh
+                // breakout E6 requires — E4 already excluded the current bar,
+                // so it cannot be the same one that opened the position.
+                freshBreakout: true,
+              });
+
+        if (!verdict.armed) {
+          ledger.append({
+            action: 'refusal',
+            engine: 'engine-loop',
+            venue: this.#deps.executor.venue,
+            instrument: candidate.instId,
+            signal: held.signalId,
+            price: null,
+            size: null,
+            stop: null,
+            reason: `pyramid not armed: ${verdict.reasons.join('; ')}`,
+          });
+          outcomes.push({
+            status: 'refused',
+            signalId: null,
+            reason: `pyramid not armed on ${candidate.instId}: ${verdict.reasons.join('; ')}`,
+          });
+          continue;
+        }
+        addIndex = verdict.addIndex;
+      }
+
       const cooldownUntilMs = state.cooldownUntil(candidate.instId, nowMs);
       if (cooldownUntilMs !== undefined) {
         // E4 also checks this, but E4 only sees what it is told. The engine is
@@ -601,6 +661,18 @@ export class Engine {
 
       const entryPrice = candidate.direction === 'long' ? candidate.entryBandHigh : candidate.entryBandLow;
 
+      // An add inherits the STACK-WIDE stop, never a fresh 2xATR one. A new stop
+      // below the existing one would widen risk across the whole stack, which is
+      // the move `ratchetStop` exists to make impossible everywhere else — it
+      // must be impossible here too.
+      //
+      // Read from state rather than from `held`, because E5 has already run this
+      // cycle and may have trailed the stop since. Sizing against a stale stop
+      // and publishing a fresh one would put a different number in the record
+      // from the one the size was computed against.
+      const stackStop = held === undefined ? undefined : state.position(candidate.instId)?.currentStop;
+      const stopPrice = stackStop ?? candidate.stopPrice;
+
       let sizePercent: number;
       try {
         const sized = computeSize(config, {
@@ -609,9 +681,10 @@ export class Engine {
           openRisk,
           correlationGroup: correlationGroupFor(config, candidate.instId),
           entryPrice,
-          stopPrice: candidate.stopPrice,
+          stopPrice,
           targetPrice: candidate.targetPrice,
           side: candidate.direction,
+          ...(addIndex === undefined ? {} : { pyramidAddIndex: addIndex }),
         });
         // The governor is NOT applied again here. computeSize already halves
         // the risk fraction under `halveSizing`, and halving a second time
@@ -628,7 +701,7 @@ export class Engine {
           signal: null,
           price: String(entryPrice),
           size: null,
-          stop: String(candidate.stopPrice),
+          stop: String(stopPrice),
           reason: `${error.code}: ${error.message}`,
         });
         outcomes.push({ status: 'refused', signalId: null, reason: error.message });
@@ -642,9 +715,10 @@ export class Engine {
         direction: candidate.direction,
         entryLow: candidate.entryBandLow,
         entryHigh: candidate.entryBandHigh,
-        stopPrice: candidate.stopPrice,
+        stopPrice,
         scaleOutPrice: candidate.scaleOutPrice,
         targetPrice: candidate.targetPrice,
+        ...(addIndex === undefined ? {} : { addIndex }),
         sizePercent,
         validUntilMs: candidate.validUntilMs,
       });
@@ -717,6 +791,29 @@ export class Engine {
       outcomes.push(outcome);
 
       if (outcome.status === 'submitted') {
+        if (held !== undefined) {
+          // The stack grew. Size and the add count both move; the stop does
+          // not — it is already the stack-wide stop the add was sized against.
+          state.update({
+            ...held,
+            adds: held.adds + 1,
+            venueSize: (BigInt(held.venueSize) + outcome.size).toString(),
+          });
+          ledger.append({
+            action: 'position_opened',
+            engine: 'engine-loop',
+            venue: this.#deps.executor.venue,
+            instrument: candidate.instId,
+            signal: signalId,
+            price: String(entryPrice),
+            size: outcome.size.toString(),
+            stop: String(held.currentStop),
+            reason: `pyramid add ${addIndex ?? 0} on ${candidate.instId}`,
+            detail: { addIndex, refSignalId: held.signalId },
+          });
+          continue;
+        }
+
         state.open(
           trackNewPosition({
             instId: candidate.instId,

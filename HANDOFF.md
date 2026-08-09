@@ -45,7 +45,7 @@ Verified against live OKX on 2026-08-09 (second run, after session 7's changes):
 > was load-bearing: it made the correlation problem look like a single-cycle
 > event when it is actually a serial one that accumulates over days.
 
-Built and tested (**397 tests**): E1 universe filter (liquidity **and
+Built and tested (**425 tests**): E1 universe filter (liquidity **and
 affordability**) · E2 regime gate (stands down in chop) · E3 volatility-adjusted
 momentum ranking · E4 breakout entry with a conviction gate at 75 and **funding
 charged into the target** · E5 exits (2×ATR stop, 25% off at +2R, breakeven,
@@ -54,17 +54,18 @@ charged into the target** · E5 exits (2×ATR stop, 25% off at +2R, breakeven,
 **directional cap** · drawdown governor · kill switch · hash-chained append-only
 ledger · Trade Kit adapter · copy executor · engine loop · driver ·
 **entry AND exit signal publication** · **competition start gate** ·
-**E7 fee budget (fees measured, funding modelled)** · **Part VIII attribution**.
+**E7 fee budget (fees measured, funding modelled)** · **Part VIII attribution** ·
+**E6 pyramiding**.
 
 **It cannot place a single order, by design.** `execution.maxLeverage` is unset
 and `computeSize()` throws rather than defaulting. It stays that way until the
 Part IX stop kill test is observed. **Nothing here has touched real money** —
 and per Law 7, a safety mechanism that has never fired in a test does not exist.
 
-Still missing on the trading side: **E6 pyramiding** is in config but read by no
-code — deliberately left, because it is Stage 2 only and Stage 2 needs a doubled
-account. `exits.minHoldHours` is also dead config. The leaderboard parser cannot
-be written until the page exists on Aug 11.
+**The trading side is now code-complete.** Every config value is read by code —
+no dead thresholds, nothing that reads as a control while doing nothing. What
+remains is external: the ASP publisher, the leaderboard parser (Aug 11 only),
+funding read from venue bills rather than modelled, and the Part IX kill test.
 
 ## 0a. Session 7 — ten defects found by review, and what was done
 
@@ -172,7 +173,7 @@ rejections by reason so this question never needs asking twice.
   evidence" is a distinct verdict from "healthy", because conflating them is how
   a strategy gets changed on nine trades.
 
-Everything above is tested. The suite went from 292 to **397**.
+Everything above is tested. The suite went from 292 to **425**.
 
 ---
 
@@ -801,16 +802,28 @@ blocker for code as well as for eligibility.
 endgame, E1 affordability, **E7 fee budget**, **Part VIII attribution**.~~
 **Done in session 7** — see §0a. 397 tests.
 
-Remaining unbuilt trading code, in the order I would take it:
+~~E6 pyramiding.~~ **Built** — `src/signal/pyramid.ts`. Arms only in stage 2,
+past +2R, with the stop at breakeven or better, on a NEW breakout. Ladder 1.0 ->
+0.6 -> 0.4, max 2 adds. An add is **published as an add** (`| ADD 1 |`) rather
+than inferred, because the copy executor's refusal to add to a held position is
+what stops a redelivered signal doubling it — and because "add to the BTC long
+you already have" is a different instruction to a subscriber than "open a BTC
+long". The add inherits the **stack-wide stop**, read from state after E5 has
+run, so a fresh 2xATR stop can never widen risk across the whole stack.
 
-- **E6 pyramiding** — config read by no code. Stage 2 only, and Stage 2 needs a
-  doubled account, so this is a week away at the earliest. Lowest priority of
-  anything left.
-- **`exits.minHoldHours`** — dead config. Either wire it into E5 or delete it;
-  a threshold nobody reads is worse than no threshold, because it reads as a
-  control that exists.
+~~`exits.minHoldHours` dead config.~~ **Wired** — into the attribution, as a
+diagnostic. The spec calls 4-36h a *target band* ("both Alpha Arena winners sat
+there"), not a rule, so nothing forces an exit at either end; the report now
+shows median hold and how many trades fell outside it. Turning a descriptive
+band into a forced close would have amputated exactly the winners the whole
+design exists to hold.
+
+Remaining unbuilt:
+
 - **Funding from venue bills** rather than modelled. `src/fees.ts` is structured
   for the swap: replace the accrual, keep the budget.
+- **Leaderboard parser** and the rank-conditional half of Part X. Aug 11 only.
+- **The ASP publisher.** Still the only placeholder in the running path.
 
 Then 10 and 11.
 

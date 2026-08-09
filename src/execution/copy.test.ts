@@ -134,6 +134,7 @@ describe('parseSignal', () => {
       targetPrice: plan.targetPrice,
       sizePercent: plan.sizePercent,
       validUntilMs: plan.validUntilMs,
+      addIndex: null,
     });
   });
 
