@@ -37,10 +37,26 @@ the one thing that cannot be recovered by working harder later.
 
 ---
 
+## 1a. READ THIS FIRST — `docs/asp-and-competition.md`
+
+The authoritative ASP registration path, signal format, delivery-daemon CLI and
+competition rules are captured in **[`docs/asp-and-competition.md`](docs/asp-and-competition.md)**,
+checked against the event page and the OKX dev portal on 2026-08-09. It marks
+what is verbatim from source, what is our reading, and what is still unknown.
+
+Do not re-derive any of it from memory. Two things it corrects that were wrong
+in earlier sessions:
+
+- **The ASP is built and listed BEFORE it is registered**, and competition entry
+  comes after ASP approval. Registration is the output of deployment.
+- **The service is A2A monthly subscription**, so no public HTTPS endpoint is
+  required — and exactly one subscription service may exist, never deleted.
+
 ## 2. Decisions already made (do not relitigate without reason)
 
 | Decision | Value | Why |
 |---|---|---|
+| ASP service type | **A2A, monthly subscription** | Rule 3.3 requires one subscription service as the scoring basis. A2A needs no endpoint, so listing is not blocked on a public HTTPS deployment. Details in `docs/asp-and-competition.md` §2. |
 | Accounting basis | **Agent Trade Kit** (USDT perps) | Rule 5: one basis, chosen at registration, cannot change. Onchain OS was abandoned when Polymarket blocked Ireland. |
 | Trading account | **Sub-account**, not main | Main account is level 1 (Spot mode) and rejects perps with `sCode 51010`. Sub-account is level 2 (Futures mode). Also keeps existing balances out of the Principal Base denominator. |
 | Margin mode | **Isolated** | Cross lets one bad position consume the equity backing every other. |
