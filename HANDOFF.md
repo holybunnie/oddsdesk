@@ -1,6 +1,6 @@
 # AlphaGate — Handoff
 
-**Last updated:** 2026-08-08 (session 2 — E5 complete, E4 written but untested)
+**Last updated:** 2026-08-09 (session 3 — E4 tested and wired, publication gate built)
 **Competition:** OKX.AI Hackathon Season 1
 **Registration closes:** Aug 11 12:00 UTC+8 — **the only irreversible deadline**
 **Trading window:** Aug 11 12:00 → Aug 25 12:00 UTC+8
@@ -10,20 +10,23 @@
 
 ## 1. Where things stand in one paragraph
 
-The venue-agnostic core is built and tested (**119 tests, typecheck clean**).
-The signal scanner runs end to end against the live OKX venue and produces real
-candidates; E5 exits are complete and exhaustively tested; E4 entry is written
-but **has no tests yet**. Credentials are installed on the box and the order
-path is verified to reach the venue's margin check. Nothing can place a live
-order yet, by design: `maxLeverage` is unset until the stop kill test is
+The venue-agnostic core is built and tested (**175 tests, typecheck clean**).
+The whole signal path — E1 through E5 — is now complete and tested, and
+`scan.ts` runs it end to end against the live OKX venue and prints real entry
+candidates with bands, stops, targets and conviction breakdowns. The publication
+gate (`validateSignal`) is built. Credentials are installed on the box and the
+order path is verified to reach the venue's margin check. Nothing can place a
+live order yet, by design: `maxLeverage` is unset until the stop kill test is
 observed, and `computeSize()` refuses to produce a position while it is unset.
-The two things blocking progress are both external — funding the sub-account,
-and registering the ASP.
+What remains is the execution half — the Trade Kit adapter and the copy
+executor — plus hardening. The two things blocking progress are both external:
+funding the sub-account, and registering the ASP.
 
-**Time check:** registration closes Aug 11 12:00 UTC+8. The ASP needs ~24h of
-review with the service online throughout, so the practical deadline for
-starting registration is roughly **Aug 10 midday**. Everything in section 6 can
-be built in parallel; registration cannot be started late.
+**Time check:** registration closes Aug 11 12:00 UTC+8, so it is now **~2 days
+out** and the practical deadline for starting is roughly **Aug 10 midday**
+(the ASP needs ~24h of review with the service online throughout). Everything in
+section 6 can be built in parallel; registration cannot be started late. This is
+the one thing that cannot be recovered by working harder later.
 
 ---
 
@@ -85,7 +88,7 @@ Recorded in `config/runtime-profile.tradekit.yaml` (gitignored — machine-local
 
 ## 5. What is built
 
-All under `/workspaces/oddsdesk`, branch `core-risk-ledger`. 88 tests passing.
+All under `/workspaces/oddsdesk`, branch `core-risk-ledger`. 175 tests passing.
 
 ### `src/config.ts` + `config/default.yaml`
 Zod-validated policy loader, strict, no default-on-missing. Policy only —
@@ -176,10 +179,7 @@ The key test walks a position from entry through +5R and back through a
 pullback, feeding each plan's stop into the next step, asserting the stop never
 widens at any point.
 
-### `src/signal/entry.ts` — E4, **WRITTEN BUT UNTESTED**
-> **Do not trust this module yet.** It compiles and typechecks, but it has zero
-> tests and has never been run against real candles. Writing its test file is
-> the first task of the next session.
+### `src/signal/entry.ts` — E4, complete (24 tests)
 
 Breakout of the N-period extreme on the confirmed 1h bar, plus a 0–100
 composite conviction score gated at 75.
@@ -196,15 +196,50 @@ composite conviction score gated at 75.
   the threshold is misplaced.
 - Conviction never touches size (Law 9).
 
+The tests pin the properties the module exists to guarantee, not its output: a
+bar cannot break its own level, a touch is not a break, each conviction
+component saturates, rejections carry every reason, the target sits at exactly
+the minimum payoff ratio, and the band brackets the level on the correct side
+for both directions.
+
+### `src/signal/publish.ts` — publication gate, complete (32 tests)
+The published text is the **authoritative record** of a trade (Law 6), not a
+summary of one — the copy executor parses these numbers and acts on them.
+
+- The plan is **rounded to publishable precision first**, then formatted, then
+  validated against that same rounded plan. What we publish and what we place
+  are identical by construction, not by two code paths agreeing.
+- `validateSignal()` returns **every** failure: exact header prefix, 200-char
+  limit, live instrument, traceable id, all four prices present as absolute
+  decimals, no relative-price language, size as a percentage, stop/target
+  geometry, and the payoff ratio **re-checked against the rounded numbers**
+  (rounding can shave it, and the achievable ratio is the published one).
+- `buildSignal()` **throws** rather than returning an invalid signal, so no
+  caller can publish one by ignoring a return value.
+- `SignalCycle` enforces `generated == delivered + rejected`. This catches the
+  one failure with no other trace: a signal dropped by an early return or a
+  swallowed exception, where the only evidence is an absence.
+- `formatPrice` trims trailing zeros **only inside the fraction**. Trimming
+  unconditionally turned `118000` into `118` — a price three orders of magnitude
+  wrong that still looks like a price. There is a test.
+
 ### `src/scripts/scan.ts`
-Live observability tool. Run it any time:
+Live observability tool, now running **E1 → E4**. Run it any time:
 
 ```bash
-npx tsx src/scripts/scan.ts
+NODE_OPTIONS=--dns-result-order=ipv4first npx tsx src/scripts/scan.ts
 ```
 
-Last live run: **82 instruments passed E1** from 423 listed; **7 of 16 extreme
-candidates passed E2**; regime favourable.
+It prints entry bands, stops, targets and the conviction breakdown for every
+candidate that cleared E2, plus a count against `targetTradesPerDay` so an
+over-loose threshold is visible rather than inferred.
+
+Last live run (2026-08-09): **79 instruments passed E1** from 423 listed; **5 of
+14 extreme candidates passed E2**; regime favourable; **1 entry signal**. The
+four rejections were all *no breakout* at conviction 89–100 — the gate holding a
+strong-but-untriggered candidate back, which is exactly its job.
+
+It is stateless, so it passes no cooldown. The live engine must.
 
 ---
 
@@ -248,21 +283,14 @@ candidates passed E2**; regime favourable.
 
 ### Buildable now, no funding needed
 
+~~5. Test E4.~~ **Done** — 24 tests.
+~~6. Wire E4 into `scan.ts`.~~ **Done** — 1 signal from a 79-instrument
+universe, which is the right order of magnitude.
+~~7. Signal formatting and `validateSignal()`.~~ **Done** — `src/signal/publish.ts`,
+32 tests.
+
 **Start here next session:**
 
-5. **Test E4.** `src/signal/entry.ts` exists and typechecks but has no tests.
-   Cover at minimum: a bar cannot break its own level; conviction components
-   saturate; a candidate below threshold is rejected with reasons; the target
-   sits at exactly the minimum payoff ratio; cooldown blocks re-entry; the
-   entry band brackets the breakout level on the correct side.
-6. **Wire E4 into `scan.ts`** so the live scanner prints actual entry
-   candidates with conviction scores. This is also the sanity check on trade
-   frequency — if it produces far more than ~2 signals a day across the
-   universe, the threshold is too loose. That is a tuning signal, not a good day.
-7. **Signal formatting and `validateSignal()`.** Max 200 chars, exact
-   `[Perpetual Signal]` header, absolute prices, size as a percentage, real
-   instrument. Hard gate before delivery — never skip-and-continue. Assert
-   `generated == validated == delivered + rejected` every cycle.
 8. **Trade Kit execution adapter** — implements `ExecutionAdapter` against the
    `okx` CLI. Interface already exists; this is the concrete class. Note the CLI
    needs `--profile okx-sub` and the IPv4 `NODE_OPTIONS` on every call.
@@ -272,6 +300,11 @@ candidates passed E2**; regime favourable.
 10. **Server hardening** — systemd units with `MemoryMax`, ufw, NTP, alerts,
     pending reboot (`libc6` + kernel update outstanding).
 11. **Leaderboard parser** — Aug 11 only, against the real page.
+12. **Wire the engine loop** — the piece that joins what now exists:
+    scan → E4 → `computeSize()` → `buildSignal()` → publish → `GuardedExecutor`.
+    Two things it must own that nothing else can: the **cooldown state** E4
+    expects (`scan.ts` is stateless and passes none), and a `SignalCycle` per
+    cycle with `assertBalanced()` at the end.
 
 ---
 
