@@ -174,6 +174,8 @@ export function assertValidClientOrderId(clientOrderId: string): void {
 
 type Row = Readonly<Record<string, unknown>>;
 
+type InstrumentSpec = Pick<Instrument, 'priceDecimals' | 'sizeDecimals' | 'contractValue'>;
+
 /** Required string field. OKX omits nothing but empties plenty, and '' is not a value. */
 function str(row: Row, key: string): string {
   const value = row[key];
@@ -195,7 +197,7 @@ export class TradeKitAdapter implements ExecutionAdapter {
 
   readonly #options: TradeKitOptions;
   /** Instrument specs, cached per describeVenue() call so scales stay consistent. */
-  readonly #specs = new Map<string, { priceDecimals: number; sizeDecimals: number }>();
+  readonly #specs = new Map<string, InstrumentSpec>();
 
   constructor(options: TradeKitOptions) {
     this.#options = options;
@@ -235,7 +237,7 @@ export class TradeKitAdapter implements ExecutionAdapter {
     return payload as readonly Row[];
   }
 
-  #spec(symbol: string): { priceDecimals: number; sizeDecimals: number } {
+  #spec(symbol: string): InstrumentSpec {
     const spec = this.#specs.get(symbol);
     if (spec === undefined) {
       throw new ExecutionError(
@@ -267,9 +269,17 @@ export class TradeKitAdapter implements ExecutionAdapter {
       const priceDecimals = decimalsOf(str(row, 'tickSz'));
       const sizeDecimals = decimalsOf(str(row, 'lotSz'));
 
-      instruments.push({ symbol, priceDecimals, sizeDecimals });
+      // ctVal is the coins-per-contract multiplier. SWAP sizes are quoted in
+      // contracts, so an order sized in coins is wrong by exactly this factor.
+      const rawCtVal = optionalStr(row, 'ctVal');
+      const contractValue = rawCtVal === null ? null : Number(rawCtVal);
+      if (contractValue !== null && !(Number.isFinite(contractValue) && contractValue > 0)) {
+        throw new ExecutionError(VENUE, `${symbol} reported an unusable ctVal ${JSON.stringify(rawCtVal)}`);
+      }
+
+      instruments.push({ symbol, priceDecimals, sizeDecimals, contractValue });
       minOrderSize[symbol] = toMinorUnits(str(row, 'minSz'), sizeDecimals);
-      this.#specs.set(symbol, { priceDecimals, sizeDecimals });
+      this.#specs.set(symbol, { priceDecimals, sizeDecimals, contractValue });
 
       const lever = optionalStr(row, 'lever');
       if (lever !== null) venueMaxLeverage = Math.max(venueMaxLeverage, Number(lever));
@@ -454,8 +464,8 @@ export class TradeKitAdapter implements ExecutionAdapter {
       const size = str(row, 'pos');
       if (Number(size) === 0) continue; // flat rows linger after a close
 
-      const { priceDecimals, sizeDecimals } = this.#spec(symbol);
-      const instrument: Instrument = { symbol, priceDecimals, sizeDecimals };
+      const { priceDecimals, sizeDecimals, contractValue } = this.#spec(symbol);
+      const instrument: Instrument = { symbol, priceDecimals, sizeDecimals, contractValue };
       const posSide = optionalStr(row, 'posSide');
       const magnitude = size.startsWith('-') ? size.slice(1) : size;
       const side =

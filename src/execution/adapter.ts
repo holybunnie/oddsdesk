@@ -28,6 +28,16 @@ export interface Instrument {
   readonly symbol: string;
   readonly priceDecimals: Decimals;
   readonly sizeDecimals: Decimals;
+  /**
+   * Coins per contract, where the venue quotes size in contracts.
+   *
+   * Required and explicitly nullable rather than optional: on a contract venue
+   * a missing multiplier silently mis-sizes every order by the multiplier
+   * itself (BTC-USDT-SWAP is 0.01 BTC per contract, so a hundredfold), and an
+   * optional field is one a caller can forget. `null` means the venue quotes
+   * size in the base asset directly and no conversion applies.
+   */
+  readonly contractValue: number | null;
 }
 
 /**

@@ -63,7 +63,7 @@ const BTC_INSTRUMENT_ROW = {
 
 const FEE_ROW = { maker: '-0.0002', taker: '-0.0005', level: 'Lv1' };
 
-const btc: Instrument = { symbol: 'BTC-USDT-SWAP', priceDecimals: 1, sizeDecimals: 2 };
+const btc: Instrument = { symbol: 'BTC-USDT-SWAP', priceDecimals: 1, sizeDecimals: 2, contractValue: 0.01 };
 
 function makeCli(): FakeCli {
   return new FakeCli()
@@ -184,7 +184,9 @@ describe('describeVenue', () => {
   it('measures instruments and fees from the venue', async () => {
     const profile = await makeAdapter(makeCli()).describeVenue();
 
-    expect(profile.instruments).toEqual([{ symbol: 'BTC-USDT-SWAP', priceDecimals: 1, sizeDecimals: 2 }]);
+    expect(profile.instruments).toEqual([
+      { symbol: 'BTC-USDT-SWAP', priceDecimals: 1, sizeDecimals: 2, contractValue: 0.01 },
+    ]);
     expect(profile.minOrderSize['BTC-USDT-SWAP']).toBe(1n);
     expect(profile.venue).toBe('okx-tradekit');
   });

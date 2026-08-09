@@ -26,7 +26,7 @@ import {
 } from './adapter.js';
 import { GuardedExecutor, MissingStopError, StaleFeedError, type FeedFreshness } from './guarded.js';
 
-const instrument: Instrument = { symbol: 'BTC-USDT-SWAP', priceDecimals: 2, sizeDecimals: 6 };
+const instrument: Instrument = { symbol: 'BTC-USDT-SWAP', priceDecimals: 2, sizeDecimals: 6, contractValue: 0.01 };
 
 class RecordingAdapter implements ExecutionAdapter {
   readonly venue = 'test-venue';
