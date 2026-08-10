@@ -1,5 +1,43 @@
 # AlphaGate — Handoff
 
+## 2026-08-10 — competition posture increased to 3% risk
+
+- At the user's explicit direction for a top-three mandate, fixed fractional
+  risk was increased to **3% in all three stages**.
+- The portfolio heat cap remains **6%**, so no more than two positions can carry
+  full initial risk simultaneously. Isolated margin, venue-held stops, the 5x
+  leverage ceiling, directional/correlation caps, and drawdown governors remain
+  unchanged.
+- At 319.897 USDT equity, initial stop risk is approximately **9.60 USDT per
+  trade**. A +3R outcome is approximately +28.79 USDT before compounding.
+
+## 2026-08-10 — live cutover complete
+
+- The registered competition sub-account (`okx-sub`, UID remains redacted in
+  chat) is funded with **319.897 USDT** in the trading account.
+- The account was changed from `long_short_mode` to the required `net_mode`
+  only after confirming there were no positions, regular orders, or algo
+  orders. Those checks remained empty after cutover.
+- The demo kill test recorded venue-held stops. The live runtime profile now
+  records `venue-held`, `killTestObserved: true`, `net_mode`, and a maximum
+  leverage ceiling of **5**.
+- A stale pre-live state file contained the demo venue's ~4,999.99 USDT peak.
+  The dry preflight caught it through the drawdown governor before any signal
+  or order. The contaminated state and empty ledger were preserved at
+  `/opt/oddsdesk/var/prelive-demo-contamination-20260810T2118Z`; clean live
+  state initialized at 319.897 USDT equity and peak.
+- The VPS typecheck/build and all **457 tests** passed. A stopped live dry cycle
+  passed with the governor normal and no signal or order.
+- `oddsdesk-demo.service` is now inactive and disabled.
+  `oddsdesk-engine.service` is active and enabled with zero restarts and a
+  current heartbeat. `okx-a2a.service` remains active and enabled.
+- The live engine started before the competition window and correctly reports
+  phase `before`; its hard gate prevents entries until
+  **2026-08-11 04:00 UTC** (12:00 UTC+8). No live trade has yet been placed.
+- A repeatable live deployment installer is at `ops/install-live.sh`. It copies
+  only the `okx-sub` API profile into the service account and leaves the engine
+  stopped for preflight.
+
 ## 2026-08-10 — confirmed competition registration and live cutover pause
 
 - **AlphaGate is already registered for the OKX.AI Trading Hackathon.** A repeat
