@@ -27,6 +27,20 @@
   setting.
 - Current services: `oddsdesk-demo.service` is enabled and active;
   `oddsdesk-engine.service` is not installed; the A2A publisher is active.
+- Demo deployment was updated and verified at commit **`43ed72b`** after the
+  breadth audit and risk decision. VPS typecheck, build, all **457 tests**, and
+  the demo-environment balance guard passed. `oddsdesk-demo.service` is active
+  with 1% risk in every stage. This is still simulated trading; no live order
+  or real-fund action was performed.
+- During that deployment, the old demo process acknowledged SIGTERM but its
+  active dual-venue scan exceeded systemd's default 90-second stop timeout and
+  was force-killed. Both demo and live unit templates now allow 300 seconds for
+  the engine's existing "finish current cycle" shutdown path. The live unit
+  also carries the IPv4 DNS setting directly, rather than relying only on an
+  environment file.
+- `npm ci` reports five dependency advisories (3 moderate, 1 high, 1 critical).
+  Do not run `npm audit fix --force` during cutover: it may introduce breaking
+  dependency changes. Audit and upgrade them separately with the full suite.
 
 ### Resume after funding
 
@@ -44,6 +58,10 @@
 5. Stop and disable the demo service only when the live preflight passes; then
    enable/start the live engine and verify its heartbeat, A2A publication, and
    first valid USDT-perpetual trade.
+
+**Operator resume phrase:** after funding, say `AlphaGate is funded; continue
+the live cutover from HANDOFF.md`. The first action is read-only verification,
+not starting the engine.
 
 ## 2026-08-10 — breadth hypothesis audit and risk decision
 

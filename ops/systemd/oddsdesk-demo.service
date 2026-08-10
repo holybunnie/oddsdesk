@@ -13,6 +13,10 @@ Environment=NODE_OPTIONS=--dns-result-order=ipv4first
 ExecStart=/usr/bin/node --import tsx src/scripts/run-engine.ts --demo
 Restart=always
 RestartSec=10
+# A six-major dual-venue scan can exceed systemd's 90s default. The engine
+# handles SIGTERM by finishing its current cycle so state/ledger writes remain
+# coherent; give that path one full reconcile interval before forced kill.
+TimeoutStopSec=300
 MemoryMax=400M
 NoNewPrivileges=true
 PrivateTmp=true

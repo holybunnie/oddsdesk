@@ -8,9 +8,12 @@ Type=simple
 User=oddsdesk
 WorkingDirectory=/opt/oddsdesk
 EnvironmentFile=-/etc/oddsdesk/engine.env
+Environment=HOME=/opt/oddsdesk
+Environment=NODE_OPTIONS=--dns-result-order=ipv4first
 ExecStart=/usr/bin/node --import tsx src/scripts/run-engine.ts --live
 Restart=always
 RestartSec=10
+TimeoutStopSec=300
 MemoryMax=400M
 NoNewPrivileges=true
 PrivateTmp=true
