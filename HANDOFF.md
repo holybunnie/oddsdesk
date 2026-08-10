@@ -45,6 +45,26 @@
    enable/start the live engine and verify its heartbeat, A2A publication, and
    first valid USDT-perpetual trade.
 
+## 2026-08-10 — breadth hypothesis audit and risk decision
+
+- Stage risk is now fixed at **1% in all three stages**. The frozen strategy's
+  exact-cost edge is regime-dependent; account growth is not evidence that the
+  edge strengthened, so Stage 2 no longer jumps from 1% to 3%.
+- A predeclared research gate tested whether short continuation improves when
+  dual-venue bearish breadth across the six majors is greater than exactly
+  eight hours earlier. The live strategy was not changed before seeing the
+  result.
+- The expanding-breadth rerun produced 73 pooled trades, +10.9R and PF 1.20.
+  Hit rate improved in 4/5 folds, but only 3/5 folds had positive net R, the
+  sample missed the 100-trade floor, and gross wins were too concentrated by
+  fold. Decision: **REJECT**. Do not add the expanding-breadth gate to live
+  trading or tune the lookback after seeing this result.
+- The audit is reproducible with:
+
+  ```text
+  npm run continuation-breadth-audit -- var/backtest/majors-540d-exact.json
+  ```
+
 **Last updated:** 2026-08-10 (session 8 — ASP submission and persistent A2A daemon,
 the demo-test boundary; previous session covered exit publication, the competition
 clock, directional cap, funding as a cost, Part X, E7 and Part VIII)

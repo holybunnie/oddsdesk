@@ -58,8 +58,15 @@ risk:
   # Fixed fractional risk per attempt, by stage. Law 9: the agent must be
   # structurally incapable of varying risk per trade. One function, no override.
   riskFractionByStage:
-    1: 0.02
-    2: 0.03
+    # The frozen strategy's pooled exact-cost edge is only 0.069R/trade and
+    # three of five chronological folds lost. One percent is the competition
+    # compromise: enough to matter over a short window without sizing a
+    # regime-dependent estimate near full Kelly.
+    1: 0.01
+    # Do not infer a stronger edge from account growth. The chronological
+    # evidence is regime-dependent, so Stage 2 cannot triple risk after a lucky
+    # run and convert path luck into a larger subsequent drawdown.
+    2: 0.01
     3: 0.01
 
   # Portfolio heat. Crypto perps correlate around 0.8 — three longs is one trade

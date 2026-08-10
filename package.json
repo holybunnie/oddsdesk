@@ -25,6 +25,7 @@
     "entry-architecture-tournament": "node --import tsx src/scripts/entry-architecture-tournament.ts",
     "continuation-confidence-tournament": "node --import tsx src/scripts/continuation-confidence-tournament.ts",
     "continuation-robustness-audit": "node --import tsx src/scripts/continuation-robustness-audit.ts",
+    "continuation-breadth-audit": "node --import tsx src/scripts/continuation-breadth-audit.ts",
     "model-tournament": "node --import tsx src/scripts/model-tournament.ts",
     "validate-registration": "node --import tsx src/scripts/validate-registration.ts",
     "watchdog": "node --import tsx src/scripts/watchdog.ts"

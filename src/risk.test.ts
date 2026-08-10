@@ -149,7 +149,7 @@ describe('fixed fractional sizing', () => {
     const wide = computeSize(config, request({ stopPrice: 90, targetPrice: 150 }));
 
     expect(tight.riskUsdt).toBeCloseTo(wide.riskUsdt, 10);
-    expect(tight.riskUsdt).toBeCloseTo(320 * 0.02, 10);
+    expect(tight.riskUsdt).toBeCloseTo(320 * 0.01, 10);
     expect(wide.notionalUsdt).toBeLessThan(tight.notionalUsdt);
   });
 
@@ -159,7 +159,7 @@ describe('fixed fractional sizing', () => {
       equity: { equityUsdt: 800, peakEquityUsdt: 1000 },
     });
     expect(result.governor).toBe('halveSizing');
-    expect(result.riskFraction).toBeCloseTo(0.01, 10);
+    expect(result.riskFraction).toBeCloseTo(0.005, 10);
   });
 
   it('exposes no override path for risk', () => {
@@ -170,9 +170,9 @@ describe('fixed fractional sizing', () => {
 
 describe('leverage is an output, not an input', () => {
   it('reports emergent leverage well under the cap on a normal stop', () => {
-    // 2% risk with a 1% stop distance is 2x notional. The cap is nowhere near.
+    // 1% risk with a 1% stop distance is 1x notional. The cap is nowhere near.
     const result = computeSize(config, request({ targetPrice: 105 }));
-    expect(result.leverage).toBeCloseTo(2, 6);
+    expect(result.leverage).toBeCloseTo(1, 6);
     expect(result.leverage).toBeLessThan(requireMaxLeverage(config));
   });
 
@@ -185,8 +185,8 @@ describe('leverage is an output, not an input', () => {
   });
 
   it('honours a measured per-instrument leverage ceiling below policy cap', () => {
-    expect(() => computeSize(config, request({ instrumentMaxLeverage: 1.5, targetPrice: 105 }))).toThrow(
-      /against a 1.5x cap/,
+    expect(() => computeSize(config, request({ instrumentMaxLeverage: 0.75, targetPrice: 105 }))).toThrow(
+      /against a 0.75x cap/,
     );
   });
 });
@@ -197,8 +197,8 @@ describe('portfolio heat and correlation caps', () => {
       ...request({ targetPrice: 105 }),
       openRisk: [held('ETH-PERP', 'eth-beta', 6.4)],
     });
-    // 6.4 held + 6.4 new = 12.8 on 320 equity = 4%, under the 6% cap.
-    expect(result.heatAfter).toBeCloseTo(0.04, 6);
+    // 6.4 held + 3.2 new = 9.6 on 320 equity = 3%, under the 6% cap.
+    expect(result.heatAfter).toBeCloseTo(0.03, 6);
   });
 
   it('refuses when heat would breach the cap', () => {
@@ -217,7 +217,7 @@ describe('portfolio heat and correlation caps', () => {
       ...request({ targetPrice: 105 }),
       openRisk: [held('ETH-PERP', 'eth-beta', 0, 'short'), held('SOL-PERP', 'high-beta-alt', 0, 'short')],
     });
-    expect(result.heatAfter).toBeCloseTo(0.02, 6);
+    expect(result.heatAfter).toBeCloseTo(0.01, 6);
   });
 
   it('refuses a fourth concurrent position', () => {

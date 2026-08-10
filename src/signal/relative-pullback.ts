@@ -76,6 +76,10 @@ export interface RelativePullbackTrade {
   readonly exitClass: ExitClass;
   readonly realisedNetR: number;
   readonly fundingCovered: boolean;
+  /** Directional dual-venue trend breadth known at the entry decision. */
+  readonly directionalBreadth: number;
+  /** The same breadth exactly eight hours (two decision intervals) earlier. */
+  readonly priorDirectionalBreadth8h: number;
 }
 
 export interface RelativePullbackResult {
@@ -122,6 +126,17 @@ export interface RelativePullbackOptions {
   readonly requireBtcAlignment?: boolean;
   readonly entryMode?: 'pullback' | 'breakout' | 'continuation';
   readonly minAbsoluteScore?: number;
+  /** Research gate: current directional breadth must exceed breadth 8h ago. */
+  readonly requireExpandingDirectionalBreadth8h?: boolean;
+}
+
+export type BreadthChange = 'expanding' | 'flat' | 'contracting';
+
+export function classifyBreadthChange(current: number, prior: number): BreadthChange {
+  if (!Number.isInteger(current) || !Number.isInteger(prior) || current < 0 || prior < 0) {
+    throw new Error('breadth counts must be non-negative integers');
+  }
+  return current > prior ? 'expanding' : current < prior ? 'contracting' : 'flat';
 }
 
 function ema(candles: readonly Candle[], period: number): number {
@@ -292,6 +307,7 @@ export function testRelativePullback(dataset: ReplayDataset, options: RelativePu
   const requireBtcAlignment = options.requireBtcAlignment ?? false;
   const entryMode = options.entryMode ?? 'pullback';
   const minAbsoluteScore = options.minAbsoluteScore ?? 0;
+  const requireExpandingDirectionalBreadth8h = options.requireExpandingDirectionalBreadth8h ?? false;
   if (!Number.isInteger(maxHoldHours) || maxHoldHours < 24) throw new Error('maxHoldHours must be an integer of at least 24');
   if (!Number.isFinite(stopAtrMultiple) || stopAtrMultiple <= 0) throw new Error('stopAtrMultiple must be positive');
   if (!Number.isFinite(targetR) || targetR <= 0) throw new Error('targetR must be positive');
@@ -311,8 +327,13 @@ export function testRelativePullback(dataset: ReplayDataset, options: RelativePu
 
   const trades: RelativePullbackTrade[] = [];
   const blockedUntil = new Map<string, number>();
+  const statesByTime = new Map<number, readonly RelativeState[]>();
   for (const timestampMs of times) {
-    const timestampStates = states.filter((state) => state.timestampMs === timestampMs);
+    statesByTime.set(timestampMs, states.filter((state) => state.timestampMs === timestampMs));
+  }
+  for (const timestampMs of times) {
+    const timestampStates = statesByTime.get(timestampMs) ?? [];
+    const priorStates = statesByTime.get(timestampMs - 8 * HOUR_MS) ?? [];
     const candidates = timestampStates
       .filter((state) => state.pullback !== undefined && state.trendStrength >= minTrendGapFraction && Math.abs(state.score) >= minAbsoluteScore)
       .sort((left, right) => right.score - left.score);
@@ -322,12 +343,20 @@ export function testRelativePullback(dataset: ReplayDataset, options: RelativePu
       .filter((state) => (blockedUntil.get(state.instrument.instId) ?? Number.NEGATIVE_INFINITY) <= timestampMs)
       .filter((state) => timestampStates.filter((peer) => peer.trend === state.pullback).length >= minDirectionalBreadth)
       .filter((state) => !requireBtcAlignment || timestampStates.find((peer) => peer.instrument.instId === 'BTC-USDT-SWAP')?.trend === state.pullback)
+      .filter((state) => {
+        if (!requireExpandingDirectionalBreadth8h || state.pullback === undefined) return true;
+        const currentBreadth = timestampStates.filter((peer) => peer.trend === state.pullback).length;
+        const priorBreadth = priorStates.filter((peer) => peer.trend === state.pullback).length;
+        return classifyBreadthChange(currentBreadth, priorBreadth) === 'expanding';
+      })
       .sort((left, right) => Math.abs(right.score) - Math.abs(left.score))[0];
     if (chosen === undefined || chosen.pullback === undefined) continue;
     if (policy === 'covered' && !fundingIsCovered(chosen.instrument.funding, timestampMs, timestampMs + maxHoldHours * HOUR_MS)) continue;
     const riskPrice = atr(chosen.candles1h, 14) * stopAtrMultiple;
     const path = followBarrier(chosen.instrument.candles1h, chosen.currentIndex, chosen.pullback, chosen.current.close, riskPrice, targetR, maxHoldHours);
     const result = netR(chosen, chosen.pullback, path, policy, stressRate, stopAtrMultiple, maxHoldHours);
+    const directionalBreadth = timestampStates.filter((peer) => peer.trend === chosen.pullback).length;
+    const priorDirectionalBreadth8h = priorStates.filter((peer) => peer.trend === chosen.pullback).length;
     trades.push({
       instId: chosen.instrument.instId,
       direction: chosen.pullback,
@@ -337,6 +366,8 @@ export function testRelativePullback(dataset: ReplayDataset, options: RelativePu
       exitClass: path.exitClass,
       realisedNetR: result.netR,
       fundingCovered: result.covered,
+      directionalBreadth,
+      priorDirectionalBreadth8h,
     });
     blockedUntil.set(chosen.instrument.instId, path.exitTimeMs);
   }
@@ -374,7 +405,7 @@ export function testRelativePullback(dataset: ReplayDataset, options: RelativePu
       `Top/bottom ${RELATIVE_TOP_BOTTOM_COUNT} ranks are eligible; the selected candidate is the largest absolute score per four-hour window.`,
       `Trend requires ${RELATIVE_PULLBACK_POLICY.trend}; trigger requires ${RELATIVE_PULLBACK_POLICY.trigger}; ${RELATIVE_PULLBACK_POLICY.confirmation}.`,
       `Entry mode: ${entryMode}.`,
-      `Regime filter requires EMA-gap strength >=${minTrendGapFraction}, directional breadth >=${minDirectionalBreadth}/${dataset.instruments.length}${requireBtcAlignment ? ', and BTC alignment' : ''}.`,
+      `Regime filter requires EMA-gap strength >=${minTrendGapFraction}, directional breadth >=${minDirectionalBreadth}/${dataset.instruments.length}${requireBtcAlignment ? ', BTC alignment' : ''}${requireExpandingDirectionalBreadth8h ? ', and directional breadth greater than 8h earlier' : ''}.`,
       `Relative-strength confidence requires absolute score >=${minAbsoluteScore}.`,
       `Execution path uses OKX candles only: ${stopAtrMultiple} ATR(14) stop, unscaled ${targetR}R target, ${maxHoldHours}h maximum hold, ${direction}, stop-first on ambiguous OHLC bars.`,
       'Costs include 2 bps fee plus 2 bps slippage per side, the recorded OKX spread, and OKX funding under the selected policy.',
