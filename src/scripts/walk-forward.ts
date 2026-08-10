@@ -45,17 +45,17 @@ function variants(base: Config): readonly Variant[] {
       regime: { minAdx: 18, minVolumeTrend: 0.8 },
     }),
     variant(base, 'exit-late', {
-      exits: { scaleOutAtR: 3, breakevenAtR: 3, tightenTrailAtR: 5 },
+      exits: { scaleOutAtR: 3, tightenTrailAtR: 5 },
     }),
     variant(base, 'late-moderate', {
       signals: { minConviction: 70, minInstrumentsPassingRegime: 2 },
       regime: { minAdx: 20, minVolumeTrend: 0.9 },
-      exits: { scaleOutAtR: 3, breakevenAtR: 3, tightenTrailAtR: 5 },
+      exits: { scaleOutAtR: 3, tightenTrailAtR: 5 },
     }),
     variant(base, 'late-broad', {
       signals: { minConviction: 65, minInstrumentsPassingRegime: 2 },
       regime: { minAdx: 18, minVolumeTrend: 0.8 },
-      exits: { scaleOutAtR: 3, breakevenAtR: 3, tightenTrailAtR: 5 },
+      exits: { scaleOutAtR: 3, tightenTrailAtR: 5 },
     }),
   ];
 }

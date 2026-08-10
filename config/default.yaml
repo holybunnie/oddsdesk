@@ -237,6 +237,11 @@ regime:
 # correlate around 0.8, so three "different" longs is one trade wearing three
 # hats, which is the failure mode that kills accounts in a drawdown.
 #
+strategy:
+  # Frozen after the 540-day exact-cost tournament. Changing this mode changes
+  # both entry and exit architecture; it is not a runtime tuning knob.
+  mode: frozen-short-continuation
+
 # Deliberately coarse. A fine-grained taxonomy would let three L1 alts through
 # as three groups, which is the exact concentration this is meant to prevent.
 correlationGroups:
@@ -338,30 +343,30 @@ exits:
   # instrument's volatility, which is what makes a 3% stop on BTC and a 9% stop
   # on a high-beta alt equivalent risk.
   atrPeriod: 14
-  initialStopAtrMultiple: 2.0
+  # Wider initial room, with risk-based sizing keeping dollar risk constant.
+  initialStopAtrMultiple: 2.5
 
-  # Only 25% off at +2R: at a 30% win rate the entire expectancy lives in the
-  # fat right tail, and scaling out heavily amputates the trade that wins.
+  # Keep the first scale-out small: the right tail is the strategy's expectancy.
   scaleOutAtR: 2.0
-  scaleOutFraction: 0.25
-  breakevenAtR: 2.0
+  scaleOutFraction: 0.15
 
   chandelierAtrMultiple: 3.0
   tightenTrailAtR: 4.0
-  tightenedChandelierAtrMultiple: 2.5
+  # Deliberately equal to the initial trail. The tail is not squeezed at +4R.
+  tightenedChandelierAtrMultiple: 3.0
 
-  # Dead trades consume margin, portfolio heat and attention.
-  timeStopHours: 12
-  timeStopRequiresR: 1.0
+  # Give a trend two days to resolve; only close it if it is still below +0.5R.
+  timeStopHours: 48
+  timeStopRequiresR: 0.5
   minHoldHours: 4
-  maxHoldHours: 36
+  maxHoldHours: 48
 
   # No re-entry on an instrument after a stop-out.
   reentryCooldownHours: 4
 
 pyramiding:
   # Stage 2 only, past +2R, stop at breakeven or better.
-  enabled: true
+  enabled: false
   maxAdds: 2
   # Each add smaller than the last. Decreasing sizes plus the stack-wide
   # trailing stop are what separate this from over-leveraging in disguise.

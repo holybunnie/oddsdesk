@@ -6,10 +6,10 @@
  * single fact dictates everything here:
  *
  *  - cut losers mechanically, with no discretion and no re-entry
- *  - take only 25% off at +2R — scaling out heavily amputates the trade that wins
- *  - move the stop to breakeven so the trade becomes free, then let it run
- *  - trail wide (3x ATR) so noise cannot shake out the tail, tightening only
- *    once the trade is already large
+ *  - take only a small fraction off at +2R — scaling out heavily amputates the
+ *    trade that wins
+ *  - let the Chandelier be the only ratchet; a breakeven stop is too easy to wick
+ *  - trail wide (3x ATR) so noise cannot shake out the tail
  *
  * The module is a pure function of position state and market state. It places
  * no orders — it returns decisions the executor carries out — which is what
@@ -17,6 +17,7 @@
  */
 
 import type { CompetitionPhase, Config } from '../config.js';
+import { FROZEN_CONTINUATION_POLICY } from './frozen-continuation.js';
 
 export type Side = 'long' | 'short';
 
@@ -154,8 +155,7 @@ export function initialStopFor(config: Config, side: Side, entryPrice: number, a
  *   1. stop hit          — exit fully, no negotiation
  *   2. time stop         — dead trades consume margin, heat and attention
  *   3. scale-out at +2R  — once only
- *   4. breakeven move    — makes the trade free
- *   5. trail             — only past the scale-out threshold
+ *   4. trail             — only past the scale-out threshold
  *
  * A losing position produces nothing but "hold" until its stop is hit or the
  * time stop fires. There is deliberately no path that widens a stop, averages
@@ -223,9 +223,39 @@ export function evaluateExit(
     };
   }
 
-  // 2. Time stop. A trade that has not reached +1R within the window is not
-  //    working, and holding it costs margin and portfolio heat that a live
-  //    candidate could use.
+  // Frozen candidate exit architecture. The research pass used one intact
+  // position, a hard 3R target and a 168h timeout. Falling through to the
+  // legacy scale-out/Chandelier rules would execute a different strategy than
+  // the one promoted, so the branch is terminal and deliberately small.
+  if (config.strategy.mode === 'frozen-short-continuation') {
+    if (r >= FROZEN_CONTINUATION_POLICY.targetR) {
+      return {
+        instId: position.instId,
+        rMultiple: r,
+        actions: [{
+          kind: 'close_full',
+          reason: `frozen target reached at ${r.toFixed(2)}R`,
+          cooldownUntilMs,
+        }],
+      };
+    }
+    const frozenAgeHours = (market.nowMs - position.openedAtMs) / 3_600_000;
+    if (frozenAgeHours >= FROZEN_CONTINUATION_POLICY.maxHoldHours) {
+      return {
+        instId: position.instId,
+        rMultiple: r,
+        actions: [{
+          kind: 'close_full',
+          reason: `frozen ${FROZEN_CONTINUATION_POLICY.maxHoldHours}h maximum hold (${r.toFixed(2)}R)`,
+          cooldownUntilMs,
+        }],
+      };
+    }
+    return { instId: position.instId, rMultiple: r, actions: [{ kind: 'hold' }] };
+  }
+
+  // 2. Time stop. A trade that has not reached the working threshold within
+  //    the window is not working, and holding it costs margin and heat.
   const ageHours = (market.nowMs - position.openedAtMs) / 3_600_000;
   if (ageHours >= exits.timeStopHours && r < exits.timeStopRequiresR) {
     return {
@@ -243,8 +273,7 @@ export function evaluateExit(
     };
   }
 
-  // 3. Scale-out, once. Only 25% so three-quarters of the tail survives — the
-  //    trade that wins the competition is the one not amputated here.
+  // 3. Scale-out, once. Keep it small so most of the tail survives.
   if (!position.scaledOut && r >= exits.scaleOutAtR) {
     actions.push({
       kind: 'scale_out',
@@ -253,21 +282,9 @@ export function evaluateExit(
     });
   }
 
-  // 4. Breakeven. From here the trade cannot lose money, which is what buys the
-  //    patience to let the remainder run.
-  if (r >= exits.breakevenAtR) {
-    const breakeven = ratchetStop(position.side, position.currentStop, position.entryPrice);
-    if (breakeven !== position.currentStop) {
-      actions.push({
-        kind: 'move_stop',
-        to: breakeven,
-        reason: `+${r.toFixed(2)}R reached — stop to breakeven, the trade is now free`,
-      });
-    }
-  }
-
-  // 5. Trail. Wide at first so ordinary noise cannot shake out the tail,
-  //    tightening only once the trade is already large.
+  // 4. Trail. The Chandelier is the only ratchet. Keeping the configured
+  //    +4R multiple equal to the initial multiple deliberately disables the
+  //    old tightening step without introducing another exit rule.
   //    In the endgame the trail also applies to trades that have NOT reached the
   //    scale-out threshold. Normally a small winner is given room, because there
   //    is time for it to become a large one; inside the last 24 hours there is
@@ -283,15 +300,9 @@ export function evaluateExit(
 
     const trail = chandelierStop(position.side, market, multiple);
 
-    // Ratchet against whatever the breakeven step may have just proposed, so
-    // the two rules cannot fight and loosen the stop between them.
-    const proposedSoFar = actions.reduce<number>(
-      (stop, action) => (action.kind === 'move_stop' ? action.to : stop),
-      position.currentStop,
-    );
-    const trailed = ratchetStop(position.side, proposedSoFar, trail);
+    const trailed = ratchetStop(position.side, position.currentStop, trail);
 
-    if (trailed !== proposedSoFar) {
+    if (trailed !== position.currentStop) {
       actions.push({
         kind: 'move_stop',
         to: trailed,

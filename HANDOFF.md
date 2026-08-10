@@ -1,7 +1,53 @@
 # AlphaGate — Handoff
 
-**Last updated:** 2026-08-09 (session 7 — exit publication, the competition clock,
-the directional cap, funding as a cost, the Part X endgame, E7 and Part VIII)
+## 2026-08-10 — confirmed competition registration and live cutover pause
+
+- **AlphaGate is already registered for the OKX.AI Trading Hackathon.** A repeat
+  registration attempt returned the authoritative rejection: an existing
+  registration was found. Do not submit it again.
+- The registered competition account is the dedicated CeFi / Agent Trade Kit
+  sub-account. A read-only live account check confirmed that the configured
+  `okx-sub` profile belongs to the registered UID (the UID remains redacted).
+- The VPS resolves the OKX API endpoint to IPv6 unless explicitly constrained.
+  The API key whitelist accepts the VPS IPv4 (`54.154.121.30`) but rejected its
+  IPv6 address. All live engine and preflight commands must therefore include:
+
+  ```text
+  NODE_OPTIONS=--dns-result-order=ipv4first
+  ```
+
+  With that setting, authenticated live account queries succeed. Include it in
+  `/etc/oddsdesk/engine.env` or the live systemd unit environment.
+- Current live-account check: **0 USDT equity, no open positions**. The account
+  is not funded yet. Do not start the live engine until the trading account has
+  at least 300 USDT equivalent; the planned starting amount is **320 USDT**.
+- Current account position mode is `long_short_mode`, while AlphaGate's runtime
+  configuration expects `net_mode`. After funding, confirm there are still no
+  positions/orders and obtain explicit approval before changing this account
+  setting.
+- Current services: `oddsdesk-demo.service` is enabled and active;
+  `oddsdesk-engine.service` is not installed; the A2A publisher is active.
+
+### Resume after funding
+
+1. Re-run the live balance, account-config, orders, and positions checks using
+   profile `okx-sub` with IPv4 forced. Confirm at least 300 USDT equivalent is
+   in the **trading** account, not merely the funding account.
+2. If the account remains empty of positions and orders, ask for confirmation
+   and switch the position mode from `long_short_mode` to `net_mode`.
+3. Deploy the current reviewed repository to `/opt/oddsdesk`, install a live
+   environment that contains only the `okx-sub` credential profile, and include
+   the IPv4 `NODE_OPTIONS` setting. Do not expose or copy credentials into chat.
+4. Install `oddsdesk-engine.service`, run a stopped/dry live preflight, and
+   verify the runtime profile records the observed venue-held stop custody and
+   leverage ceiling.
+5. Stop and disable the demo service only when the live preflight passes; then
+   enable/start the live engine and verify its heartbeat, A2A publication, and
+   first valid USDT-perpetual trade.
+
+**Last updated:** 2026-08-10 (session 8 — ASP submission and persistent A2A daemon,
+the demo-test boundary; previous session covered exit publication, the competition
+clock, directional cap, funding as a cost, Part X, E7 and Part VIII)
 **Competition:** OKX.AI Hackathon Season 1
 **Registration closes:** Aug 11 12:00 UTC+8 — **the only irreversible deadline**
 **Trading window:** Aug 11 12:00 → Aug 25 12:00 UTC+8
@@ -13,8 +59,8 @@ the directional cap, funding as a cost, the Part X endgame, E7 and Part VIII)
 
 Naming, because it has caused confusion: the **repo** is `oddsdesk`; the
 **product** is **AlphaGate**, which is the name of the *signal service* we
-publish through. That name comes from build spec Part IV. Nothing is registered
-anywhere yet, so it can still be changed at zero cost.
+publish through. That name comes from build spec Part IV. ASP identity **#10706**
+now exists with that name and is under marketplace review.
 
 This competition has two halves and they are not independent.
 
@@ -25,14 +71,68 @@ the entry and exit rules, the risk limits. **Built and tested.**
 **Half two — the publishing service (the ASP).** OKX does not let you simply
 trade. You must publish every trade as a *signal* through a service other people
 could subscribe to, and OKX checks your real trades against those published
-signals. If they do not correspond, the ranking does not count. **Not built, not
-deployed, not registered.**
+signals. If they do not correspond, the ranking does not count. **The ASP is
+created and submitted for review; the persistent A2A daemon is online. The
+trading engine is not yet deployed or started.**
 
 **They are wired together deliberately.** The executor's input is published
 signal *text*, not an internal decision object, so no order can reach the venue
 without having been published first. That makes Law 6 structural rather than a
-promise — and it also means the finished trading brain is **complete and idle**
-until the publishing service exists.
+promise — and it also means the finished trading brain remains **complete and
+idle** until the VPS runtime profile and live engine service are installed.
+
+## 0b. Session 8 — exact stopping point
+
+### ASP / A2A
+
+- ASP **#10706**, `AlphaGate`, was created successfully.
+- Its reviewed service is `Perpetual Momentum Signals`, A2A, **15 USDT/month**,
+  **3-day trial**, with the approved avatar and the exact structured description
+  in `config/asp-registration.yaml`.
+- Review submission succeeded. Current status: **Listing under review**;
+  approval status 2. It is online and has a recent heartbeat.
+- On the Lightsail VPS, `okx-a2a.service` is **active** and **enabled** under
+  systemd user services. `loginctl enable-linger ubuntu` is enabled, so it
+  survives SSH disconnects and reboots.
+- Codex CLI 0.147.0 is installed and authenticated on the VPS as the A2A
+  provider. `okx-a2a doctor`: 7 pass, 0 fail, 1 readiness warning while the
+  daemon warms; the service subsequently reported active and running.
+
+### Trading / stop-custody gate
+
+- **No live or demo order has ever been placed.** No real funds have been
+  touched.
+- The user selected a minimum-size live kill test, then asked about the demo
+  alternative. Current safe next step is the **demo API profile**; do not use
+  live money for the kill test until the user re-confirms after understanding
+  the risk.
+- VPS `okx` profiles currently include `okx-prod` and `okx-sub`; both are live.
+  No demo profile exists. Credentials must never be copied into chat or into
+  the `oddsdesk` service account without an explicit credential-handling plan.
+- `/opt/oddsdesk/config/runtime-profile.tradekit.yaml` is **missing**.
+  Stop custody is therefore unverified, and `execution.maxLeverage` must remain
+  unset. Do not start the live engine before the stop test records one of:
+  `venue-held` → cap 5; `client-held` → cap 2 plus watchdog and pyramiding off;
+  `none` → do not trade.
+- `/etc/oddsdesk/engine.env` and the `oddsdesk` systemd units are not installed
+  on the VPS. The remote `/opt/oddsdesk` checkout is still at `ab30fad`; deploy
+  the current repository before installing the engine/watchdog units.
+
+### Next handoff actions
+
+1. In OKX: **Trade → Demo Trading → Personal Center → Demo Trading API**; create
+   a separate Read + Trade demo key, with Withdraw disabled and the VPS IPv4
+   bound. Configure it directly on the VPS with `okx config init` as profile
+   `okx-demo`; never send the three credentials in chat.
+2. Run the minimum-size demo stop kill test: open isolated perp, attach stop,
+   kill the trading process, inspect the venue, reboot/inspect again, and close
+   the test position. Record the observed custody in the runtime profile.
+3. Fast-forward `/opt/oddsdesk` to the current pushed commit, install the
+   engine/watchdog units and a redacted environment file with
+   `OKX_ASP_AGENT_ID=10706`; keep the engine stopped until the profile passes.
+4. Run a dry cycle, then perform the live runtime preflight and fund the
+   competition sub-account with the planned 320 USDT. The competition clock
+   opens **2026-08-11 12:00 UTC+8**.
 
 ### Trading half — what works, and what has never run
 

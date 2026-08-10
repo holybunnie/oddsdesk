@@ -3,7 +3,7 @@ import { loadConfig } from '../config.js';
 import type { Candle, InstrumentSpec, OkxMarketData, TickerSnapshot } from '../market/okx.js';
 import { runScan } from './scan.js';
 
-const config = loadConfig('config/default.yaml');
+const config = { ...loadConfig('config/default.yaml'), strategy: { mode: 'legacy-cross-sectional' as const } };
 const HOUR = 3_600_000;
 const NOW = Date.UTC(2026, 7, 12, 9, 0, 0);
 

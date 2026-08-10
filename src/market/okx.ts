@@ -269,12 +269,18 @@ export class OkxMarketData {
       const row = raw as Record<string, unknown>;
       const instId = str(row['instId'], 'instId', 'ticker');
       const context = `ticker ${instId}`;
+      const last = num(row['last'], 'last', context);
+      // OKX reports volCcy24h for derivatives in the base currency (BTC for
+      // BTC-USDT-SWAP), while E1's liquidity threshold is denominated in the
+      // quote currency. Convert it to quote notional before filtering. Using
+      // the raw field here made BTC/ETH appear thin by factors of their prices.
+      const volumeInCurrency = num(row['volCcy24h'], 'volCcy24h', context);
       return {
         instId,
-        last: num(row['last'], 'last', context),
+        last,
         bid: num(row['bidPx'], 'bidPx', context),
         ask: num(row['askPx'], 'askPx', context),
-        quoteVolume24h: num(row['volCcy24h'], 'volCcy24h', context),
+        quoteVolume24h: volumeInCurrency * last,
       };
     });
   }

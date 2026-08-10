@@ -126,7 +126,12 @@ let stateSeq = 0;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'engine-'));
-  baseConfig = loadConfig('config/default.yaml');
+  const loaded = loadConfig('config/default.yaml');
+  baseConfig = {
+    ...loaded,
+    strategy: { mode: 'legacy-cross-sectional' },
+    pyramiding: { ...loaded.pyramiding, enabled: true },
+  };
 });
 
 function build(
@@ -242,7 +247,7 @@ describe('the cycle publishes before it executes', () => {
     const publisher = new FakePublisher();
     publisher.fail = true;
     const { engine, copy } = build({ publisher });
-    const report = await engine.runCycle(scanOf([candidate()]));
+    const report = await engine.runCycle(scanOf([candidate({ lastClose: 64_500 })]));
 
     expect(copy.executed).toHaveLength(0);
     expect(report.signals).toEqual({ generated: 1, delivered: 0, rejected: 1 });
@@ -319,7 +324,7 @@ describe('gates on new entries', () => {
     // on having remembered to pass it into E4.
     const { engine, state, publisher } = build();
     state.close('BTC-USDT-SWAP', NOW + 3_600_000);
-    const report = await engine.runCycle(scanOf([candidate()]));
+    const report = await engine.runCycle(scanOf([candidate({ lastClose: 64_500 })]));
 
     expect(publisher.published).toHaveLength(0);
     expect(report.outcomes[0]).toMatchObject({ reason: expect.stringMatching(/cooldown/) });
@@ -584,7 +589,7 @@ describe('exits are published too', () => {
     await engine.runCycle(scanOf([], { lastPrices: new Map([[btc.symbol, 66_000]]) }));
 
     const exits = publisher.published.filter((t) => t.includes('EXIT'));
-    expect(exits.some((t) => t.includes('CLOSE 25%'))).toBe(true);
+    expect(exits.some((t) => t.includes('CLOSE 15%'))).toBe(true);
   });
 
   it('publishes a stop ratchet, which moves no size but changes the published risk', async () => {

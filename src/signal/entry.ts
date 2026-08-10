@@ -46,7 +46,7 @@ export interface EntryCandidate {
   readonly entryBandLow: number;
   readonly entryBandHigh: number;
   readonly stopPrice: number;
-  /** TP1 — where E5 takes 25% off, at +`scaleOutAtR`R. */
+  /** TP1 — where E5 takes the configured small scale-out at +`scaleOutAtR`R. */
   readonly scaleOutPrice: number;
   /** TP2 — the screening target, at the minimum payoff ratio NET of carry. */
   readonly targetPrice: number;
@@ -212,14 +212,14 @@ export function evaluateEntry(config: Config, inputs: EntryInputs): EntryVerdict
   const { ranked, direction, candles1h, candles4h, nowMs } = inputs;
   const reasons: string[] = [];
 
-  // Cooldown: no re-entry on an instrument for a period after it stopped out.
-  // Re-entering immediately is how one choppy instrument bleeds an account.
-  if (inputs.cooldownUntilMs !== undefined && nowMs < inputs.cooldownUntilMs) {
+  const breakout = hasBrokenOut(config, candles1h, direction);
+
+  // Cooldown blocks ordinary re-entry after a stop, but a fresh breakout is a
+  // new thesis rather than a retry of the stopped trade. Let that signal pass.
+  if (inputs.cooldownUntilMs !== undefined && nowMs < inputs.cooldownUntilMs && !breakout.broken) {
     const minutes = (inputs.cooldownUntilMs - nowMs) / 60_000;
     reasons.push(`in post-stop cooldown for another ${minutes.toFixed(0)} minutes`);
   }
-
-  const breakout = hasBrokenOut(config, candles1h, direction);
   if (!breakout.broken) {
     reasons.push(
       `no breakout: close ${breakout.lastClose} has not cleared the ` +

@@ -24,7 +24,8 @@ import { describeCosts } from '../fees.js';
 import { Ledger } from '../ledger.js';
 import { KillSwitch } from '../kill-switch.js';
 import { OkxMarketData } from '../market/okx.js';
-import { TradeKitAdapter, okxCliRunner } from '../execution/tradekit.js';
+import { BinanceMarketData } from '../market/binance.js';
+import { TradeKitAdapter, assertTradingEnvironment, okxCliRunner } from '../execution/tradekit.js';
 import { GuardedExecutor } from '../execution/guarded.js';
 import { CopyExecutor } from '../execution/copy.js';
 import type { Instrument } from '../execution/adapter.js';
@@ -35,10 +36,8 @@ import { EngineState } from '../engine/state.js';
 import { A2aSignalPublisher } from '../publishing/a2a.js';
 import { writeHeartbeat } from '../ops/heartbeat.js';
 import { readRuntimeProfile } from '../ops/runtime-profile.js';
+import { virtualDemoBalanceMinor } from '../ops/demo-balance.js';
 
-const RUNTIME_PROFILE = 'config/runtime-profile.tradekit.yaml';
-const PROFILE = 'okx-sub';
-const HEARTBEAT_PATH = 'var/engine-heartbeat.json';
 const HEARTBEAT_INTERVAL_MS = 10_000;
 
 /**
@@ -53,10 +52,36 @@ class DryRunPublisher implements SignalPublisher {
   }
 }
 
+/** Demo signals are validated and executed locally, never pushed to subscribers. */
+class DemoPublisher implements SignalPublisher {
+  async publish(text: string): Promise<void> {
+    console.log(`[demo signal] ${text}`);
+  }
+}
+
 async function main(): Promise<void> {
   const live = process.argv.includes('--live');
-  const config = loadConfig('config/default.yaml');
-  const { stopCustody, positionMode } = readRuntimeProfile(RUNTIME_PROFILE);
+  const demoDryRun = process.argv.includes('--demo-dry-run');
+  const demo = process.argv.includes('--demo') || demoDryRun;
+  if (live && demo) throw new Error('--live and --demo are mutually exclusive');
+  const continuous = live || (demo && !demoDryRun);
+  const profile = demo ? (process.env.OKX_DEMO_PROFILE?.trim() || 'okx-demo') : 'okx-sub';
+  const runtimeProfile = demo ? 'config/runtime-profile.demo.yaml' : 'config/runtime-profile.tradekit.yaml';
+  const loadedConfig = loadConfig('config/default.yaml');
+  const { stopCustody, positionMode, maxLeverage, demoBalance } = readRuntimeProfile(runtimeProfile);
+  if (demo && demoBalance === undefined) throw new Error('demo runtime profile is missing its virtual balance baseline');
+  const config = {
+    ...loadedConfig,
+    execution: { ...loadedConfig.execution, maxLeverage },
+    ...(demo
+      ? {
+          ledger: { path: 'var/demo/ledger.sqlite' },
+          killSwitch: { path: 'var/demo/kill-switch' },
+          engineState: { path: 'var/demo/engine-state.json' },
+        }
+      : {}),
+  };
+  const heartbeatPath = demo ? 'var/demo/engine-heartbeat.json' : 'var/engine-heartbeat.json';
   const aspAgentId = process.env.OKX_ASP_AGENT_ID?.trim();
   if (live && (aspAgentId === undefined || aspAgentId === '')) {
     throw new Error(
@@ -69,10 +94,15 @@ async function main(): Promise<void> {
   const killSwitch = new KillSwitch(config.killSwitch.path);
   const state = new EngineState(config.engineState.path);
   const market = new OkxMarketData();
+  const binance = new BinanceMarketData();
+
+  const runner = okxCliRunner(profile);
+  await assertTradingEnvironment(runner, demo ? 'demo' : 'live');
+  console.log(`trading environment: ${demo ? 'demo' : 'live'} (profile ${profile})`);
 
   const adapter = new TradeKitAdapter({
-    profile: PROFILE,
-    runner: okxCliRunner(PROFILE),
+    profile,
+    runner,
     stopCustody,
     marginMode: config.execution.marginMode,
     positionMode,
@@ -96,9 +126,9 @@ async function main(): Promise<void> {
     console.log('  submitOrder will refuse. Run the Part IX kill test before expecting a fill.');
   }
 
-  const profile = await adapter.describeVenue();
-  const instruments = new Map<string, Instrument>(profile.instruments.map((i) => [i.symbol, i]));
-  console.log(`discovered ${instruments.size} live USDT perps, maker ${profile.makerFee}, taker ${profile.takerFee}`);
+  const venueProfile = await adapter.describeVenue();
+  const instruments = new Map<string, Instrument>(venueProfile.instruments.map((i) => [i.symbol, i]));
+  console.log(`discovered ${instruments.size} live USDT perps, maker ${venueProfile.makerFee}, taker ${venueProfile.takerFee}`);
 
   const executor = new GuardedExecutor({
     adapter,
@@ -111,7 +141,16 @@ async function main(): Promise<void> {
   const copyExecutor = new CopyExecutor({
     config,
     executor,
-    account: adapter,
+    account: demo
+      ? {
+          availableBalance: async () => virtualDemoBalanceMinor(
+            await adapter.availableBalance(),
+            demoBalance!.venueBaselineUsdt,
+            demoBalance!.virtualPrincipalUsdt,
+          ),
+          openPositions: async () => adapter.openPositions(),
+        }
+      : adapter,
     instruments,
     journal: state.signalJournal(),
     maxSignalAgeMs: config.entry.validityHours * 3_600_000,
@@ -126,9 +165,17 @@ async function main(): Promise<void> {
     copyExecutor,
     publisher: live
       ? new A2aSignalPublisher({ agentId: aspAgentId as string })
-      : new DryRunPublisher(),
+      : demo && !demoDryRun
+        ? new DemoPublisher()
+        : new DryRunPublisher(),
     instruments,
-    readEquity: async () => Number(await adapter.availableBalance()) / 1e8,
+    readEquity: async () => {
+      const actual = await adapter.availableBalance();
+      const measured = demo
+        ? virtualDemoBalanceMinor(actual, demoBalance!.venueBaselineUsdt, demoBalance!.virtualPrincipalUsdt)
+        : actual;
+      return Number(measured) / 1e8;
+    },
     // Stage 3 stays unreachable until the leaderboard parser exists. Returning
     // null is the honest answer: defending a rank we cannot measure is guessing.
     readRankCushion: async () => null,
@@ -139,6 +186,7 @@ async function main(): Promise<void> {
     engine,
     state,
     market,
+    binance,
     ledger,
     killSwitch,
     intervalSeconds: config.risk.reconcileIntervalSeconds,
@@ -153,8 +201,8 @@ async function main(): Promise<void> {
     },
   });
 
-  if (!live) {
-    console.log('\nDRY RUN — one cycle, then exit. Pass --live to run continuously.\n');
+  if (!continuous) {
+    console.log('\nDRY RUN — one cycle, then exit. Pass --demo or --live to run continuously.\n');
     const { report, scan } = await driver.runOnce();
     console.log(
       `universe ${scan.universeSize}/${scan.liveUsdtPerps}, ` +
@@ -181,7 +229,7 @@ async function main(): Promise<void> {
 
   const heartbeat = () => {
     try {
-      writeHeartbeat(HEARTBEAT_PATH);
+      writeHeartbeat(heartbeatPath);
     } catch (error) {
       console.error(`HEARTBEAT FAILED: ${(error as Error).message}`);
       killSwitch.trip('routeB', 'engine', `heartbeat write failed: ${(error as Error).message}`);

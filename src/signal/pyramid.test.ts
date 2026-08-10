@@ -4,7 +4,12 @@ import { computeSize, RiskRefusal, type OpenRisk } from '../risk.js';
 import type { TrackedPosition } from '../engine/state.js';
 import { aggregateRiskUsdt, evaluatePyramid } from './pyramid.js';
 
-const config = loadConfig('config/default.yaml');
+const loadedConfig = loadConfig('config/default.yaml');
+const config = {
+  ...loadedConfig,
+  strategy: { mode: 'legacy-cross-sectional' as const },
+  pyramiding: { ...loadedConfig.pyramiding, enabled: true },
+};
 const withLeverage = { ...config, execution: { ...config.execution, maxLeverage: 5 } };
 
 /** A long from 100 with R = 10, stop already ratcheted to breakeven, at +3R. */

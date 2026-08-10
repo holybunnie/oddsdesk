@@ -27,6 +27,7 @@ import type { Config } from '../config.js';
 import type { KillSwitch } from '../kill-switch.js';
 import type { Ledger } from '../ledger.js';
 import type { OkxMarketData } from '../market/okx.js';
+import type { BinanceMarketData } from '../market/binance.js';
 import type { Engine, CycleReport } from './loop.js';
 import { runScan, type ScanDiagnostics } from './scan.js';
 import type { EngineState } from './state.js';
@@ -49,6 +50,7 @@ export interface DriverDeps {
   readonly engine: Engine;
   readonly state: EngineState;
   readonly market: OkxMarketData;
+  readonly binance?: BinanceMarketData;
   readonly ledger: Ledger;
   readonly killSwitch: KillSwitch;
   /** Seconds between the END of one cycle and the START of the next. */
@@ -101,6 +103,7 @@ export class Driver {
     const scan = await runScan({
       config: this.#deps.config,
       market: this.#deps.market,
+      ...(this.#deps.binance === undefined ? {} : { binance: this.#deps.binance }),
       mustPrice: open,
       cooldowns,
       nowMs,

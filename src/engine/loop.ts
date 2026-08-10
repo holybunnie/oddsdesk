@@ -668,7 +668,10 @@ export class Engine {
       }
 
       const cooldownUntilMs = state.cooldownUntil(candidate.instId, nowMs);
-      if (cooldownUntilMs !== undefined) {
+      const freshBreakout = candidate.direction === 'long'
+        ? candidate.lastClose > candidate.breakoutLevel
+        : candidate.lastClose < candidate.breakoutLevel;
+      if (cooldownUntilMs !== undefined && !freshBreakout) {
         // E4 also checks this, but E4 only sees what it is told. The engine is
         // the only thing that knows, so it must not rely on having passed it in.
         outcomes.push({

@@ -58,6 +58,11 @@ const instant = z
 
 export const configSchema = z
   .object({
+    strategy: z
+      .object({
+        mode: z.enum(['legacy-cross-sectional', 'frozen-short-continuation']),
+      })
+      .strict(),
     /**
      * The competition clock, transcribed from the event page rather than chosen.
      *
@@ -255,7 +260,6 @@ export const configSchema = z
         initialStopAtrMultiple: positive,
         scaleOutAtR: positive,
         scaleOutFraction: fraction,
-        breakevenAtR: positive,
         chandelierAtrMultiple: positive,
         tightenTrailAtR: positive,
         tightenedChandelierAtrMultiple: positive,
@@ -268,8 +272,8 @@ export const configSchema = z
       .strict()
       .refine((e) => e.minHoldHours < e.maxHoldHours, 'minHoldHours must be below maxHoldHours')
       .refine(
-        (e) => e.tightenedChandelierAtrMultiple < e.chandelierAtrMultiple,
-        'the tightened trail must be tighter than the initial trail',
+        (e) => e.tightenedChandelierAtrMultiple <= e.chandelierAtrMultiple,
+        'the tightened trail cannot be looser than the initial trail',
       )
       .refine(
         (e) => e.tightenTrailAtR > e.scaleOutAtR,

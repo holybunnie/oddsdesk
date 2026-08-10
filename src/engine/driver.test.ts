@@ -84,7 +84,8 @@ let seq = 0;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'driver-'));
-  config = loadConfig('config/default.yaml');
+  const loaded = loadConfig('config/default.yaml');
+  config = { ...loaded, strategy: { mode: 'legacy-cross-sectional' } };
 });
 
 function build(overrides: { intervalSeconds?: number } = {}) {

@@ -24,6 +24,12 @@
 import type { Config } from '../config.js';
 import { atr } from '../signal/indicators.js';
 import { OkxMarketData, confirmedOnly, type Candle } from '../market/okx.js';
+import { BinanceMarketData } from '../market/binance.js';
+import {
+  evaluateFrozenContinuation,
+  FROZEN_MAJOR_INST_IDS,
+  type FrozenMarketState,
+} from '../signal/frozen-continuation.js';
 import { evaluateEntry, type EntryCandidate, type RejectedCandidate } from '../signal/entry.js';
 import {
   assessRegime,
@@ -90,6 +96,7 @@ export interface ScanDiagnostics {
 export interface ScanOptions {
   readonly config: Config;
   readonly market: OkxMarketData;
+  readonly binance?: BinanceMarketData;
   /**
    * Instruments that must be priced regardless of whether they pass E1 —
    * the engine's open positions. Omitting one makes the engine throw rather
@@ -102,6 +109,9 @@ export interface ScanOptions {
 }
 
 export async function runScan(options: ScanOptions): Promise<ScanDiagnostics> {
+  if (options.config.strategy.mode === 'frozen-short-continuation') {
+    return runFrozenContinuationScan(options);
+  }
   const { config, market } = options;
   const nowMs = options.nowMs ?? Date.now();
   const cooldowns = options.cooldowns ?? new Map<string, number>();
@@ -247,5 +257,102 @@ export async function runScan(options: ScanOptions): Promise<ScanDiagnostics> {
     regimePassing,
     regimeConsidered: verdicts.length,
     universeRejections: rejections,
+  };
+}
+
+function binanceSymbol(instId: string): string {
+  return `${instId.split('-')[0]}USDT`;
+}
+
+/** Production market-data adapter for the frozen six-major policy. */
+async function runFrozenContinuationScan(options: ScanOptions): Promise<ScanDiagnostics> {
+  const { config, market } = options;
+  const binance = options.binance;
+  if (binance === undefined) throw new ScanPipelineError('frozen-short-continuation requires Binance market data');
+  const nowMs = options.nowMs ?? Date.now();
+  const cooldowns = options.cooldowns ?? new Map<string, number>();
+  const instruments = await market.instruments('SWAP');
+  const liveIds = new Set(instruments.filter((instrument) => instrument.state === 'live').map((instrument) => instrument.instId));
+  for (const instId of FROZEN_MAJOR_INST_IDS) {
+    if (!liveIds.has(instId)) throw new ScanPipelineError(`${instId} is not live on OKX`);
+  }
+
+  const states: FrozenMarketState[] = [];
+  const candlesByInstrument = new Map<string, readonly Candle[]>();
+  const fundingByInstrument = new Map<string, number>();
+  let oldestOkxCloseMs = Number.POSITIVE_INFINITY;
+  let oldestBinanceCloseMs = Number.POSITIVE_INFINITY;
+  const historyFromMs = nowMs - 420 * 3_600_000;
+
+  for (let index = 0; index < FROZEN_MAJOR_INST_IDS.length; index += BATCH) {
+    await Promise.all(FROZEN_MAJOR_INST_IDS.slice(index, index + BATCH).map(async (instId) => {
+      const symbol = binanceSymbol(instId);
+      const [okx1h, okx4h, binance1h, binance4h, funding] = await Promise.all([
+        market.candles(instId, '1H', 180),
+        market.candles(instId, '4H', 90),
+        binance.historyCandles(symbol, '1h', historyFromMs, nowMs),
+        binance.historyCandles(symbol, '4h', historyFromMs, nowMs),
+        market.fundingRate(instId),
+      ]);
+      const confirmedOkx1h = confirmedOnly(okx1h);
+      const confirmedOkx4h = confirmedOnly(okx4h);
+      const confirmedBinance1h = confirmedOnly(binance1h);
+      const confirmedBinance4h = confirmedOnly(binance4h);
+      candlesByInstrument.set(instId, confirmedOkx1h);
+      fundingByInstrument.set(instId, funding);
+      oldestOkxCloseMs = Math.min(oldestOkxCloseMs, confirmedOkx1h.at(-1)?.openTimeMs ?? 0);
+      oldestBinanceCloseMs = Math.min(oldestBinanceCloseMs, confirmedBinance1h.at(-1)?.openTimeMs ?? 0);
+      states.push({
+        instId,
+        candles1h: confirmedOkx1h,
+        candles4h: confirmedOkx4h,
+        binanceCandles1h: confirmedBinance1h,
+        binanceCandles4h: confirmedBinance4h,
+      });
+    }));
+  }
+
+  // Any pre-existing position remains manageable even if it is outside the
+  // frozen universe; it never becomes entry-eligible.
+  for (const instId of options.mustPrice ?? []) {
+    if (candlesByInstrument.has(instId)) continue;
+    const [candles, funding] = await Promise.all([
+      market.candles(instId, '1H', CANDLE_LIMIT),
+      market.fundingRate(instId),
+    ]);
+    candlesByInstrument.set(instId, confirmedOnly(candles));
+    fundingByInstrument.set(instId, funding);
+  }
+
+  const lastPrices = new Map<string, number>();
+  const atrByInstrument = new Map<string, number>();
+  for (const [instId, candles] of candlesByInstrument) {
+    const last = candles.at(-1);
+    if (last === undefined) continue;
+    lastPrices.set(instId, last.close);
+    atrByInstrument.set(instId, atr(candles, config.ranking.atrPeriod));
+  }
+  const decision = evaluateFrozenContinuation(states, nowMs, cooldowns);
+  const feeds: readonly FeedFreshness[] = [
+    { name: 'okx-1h-candles', lastUpdateMs: Number.isFinite(oldestOkxCloseMs) ? oldestOkxCloseMs + 3_600_000 : 0 },
+    { name: 'binance-1h-candles', lastUpdateMs: Number.isFinite(oldestBinanceCloseMs) ? oldestBinanceCloseMs + 3_600_000 : 0 },
+  ];
+  return {
+    result: {
+      candidates: decision.candidate === undefined ? [] : [decision.candidate],
+      regimeFavourable: decision.regimeFavourable,
+      lastPrices,
+      atrByInstrument,
+      fundingRates: fundingByInstrument,
+      feeds,
+    },
+    liveUsdtPerps: instruments.filter((instrument) => instrument.instId.endsWith('-USDT-SWAP') && instrument.state === 'live').length,
+    universeSize: FROZEN_MAJOR_INST_IDS.length,
+    ranked: [],
+    assessed: [],
+    rejected: [],
+    regimePassing: decision.shortBreadth,
+    regimeConsidered: FROZEN_MAJOR_INST_IDS.length,
+    universeRejections: [],
   };
 }

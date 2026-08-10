@@ -12,8 +12,8 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { loadConfig } from '../config.js';
-import { OkxMarketData } from '../market/okx.js';
-import { selectUniverseWithRejections } from '../signal/scanner.js';
+import { confirmedOnly, OkxMarketData } from '../market/okx.js';
+import { baseSymbol, selectUniverseWithRejections } from '../signal/scanner.js';
 
 function valueAfter(flag: string, fallback: string): string {
   const index = process.argv.indexOf(flag);
@@ -21,10 +21,19 @@ function valueAfter(flag: string, fallback: string): string {
   return value ?? fallback;
 }
 
+function requestedSymbols(): readonly string[] {
+  const raw = valueAfter('--symbols', '').trim();
+  if (raw === '') return [];
+  const symbols = raw.split(',').map((symbol) => symbol.trim().toUpperCase()).filter(Boolean);
+  if (new Set(symbols).size !== symbols.length) throw new Error('--symbols contains duplicates');
+  return symbols;
+}
+
 async function main(): Promise<void> {
   const days = Number(valueAfter('--days', '90'));
   const output = valueAfter('--out', 'var/backtest/okx-90d.json');
-  if (!Number.isInteger(days) || days <= 0 || days > 365) throw new Error('--days must be an integer in 1..365');
+  const symbols = requestedSymbols();
+  if (!Number.isInteger(days) || days <= 0 || days > 730) throw new Error('--days must be an integer in 1..730');
 
   const config = loadConfig('config/default.yaml');
   const market = new OkxMarketData({ minRequestIntervalMs: 120 });
@@ -33,13 +42,18 @@ async function main(): Promise<void> {
 
   const [instruments, tickers] = await Promise.all([market.instruments('SWAP'), market.tickers('SWAP')]);
   const selected = selectUniverseWithRejections(config, instruments, tickers);
-  console.log(`recording ${selected.members.length} E1 instruments from ${instruments.length} live swaps`);
+  const members = symbols.length === 0
+    ? selected.members
+    : selected.members.filter((member) => symbols.includes(baseSymbol(member.instId)));
+  const missing = symbols.filter((symbol) => !members.some((member) => baseSymbol(member.instId) === symbol));
+  if (missing.length > 0) throw new Error(`requested symbols are not in the tradable selected universe: ${missing.join(', ')}`);
+  console.log(`recording ${members.length} instruments from ${instruments.length} live swaps${symbols.length > 0 ? ` (requested: ${symbols.join(', ')})` : ''}`);
   console.log(`range ${new Date(fromMs).toISOString()} → ${new Date(toMs).toISOString()}`);
 
   const records: unknown[] = [];
   const batchSize = 4;
-  for (let i = 0; i < selected.members.length; i += batchSize) {
-    const batch = selected.members.slice(i, i + batchSize);
+  for (let i = 0; i < members.length; i += batchSize) {
+    const batch = members.slice(i, i + batchSize);
     const rows = await Promise.all(batch.map(async (member) => {
       const [candles1h, candles4h, funding] = await Promise.all([
         market.historyCandles(member.instId, '1H', fromMs - 14 * 86_400_000, toMs),
@@ -51,8 +65,8 @@ async function main(): Promise<void> {
         instId: member.instId,
         spec: member.spec,
         spreadBps: member.spreadBps,
-        candles1h,
-        candles4h,
+        candles1h: confirmedOnly(candles1h),
+        candles4h: confirmedOnly(candles4h),
         funding,
       };
     }));

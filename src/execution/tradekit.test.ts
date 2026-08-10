@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { ExecutionError, NotVerifiedError, type Instrument, type OrderRequest } from './adapter.js';
 import {
   TradeKitAdapter,
+  assertTradingEnvironment,
   assertValidClientOrderId,
   decimalsOf,
   fromMinorUnits,
@@ -104,6 +105,18 @@ const order = (overrides: Partial<OrderRequest> = {}): OrderRequest => ({
   reason: 'E4 breakout',
   clientOrderId: 'S2608091200BTCL',
   ...overrides,
+});
+
+describe('trading environment preflight', () => {
+  it('accepts a profile only when the CLI proves demo mode', async () => {
+    const cli = new FakeCli().on('--env account balance', { env: 'demo', profile: 'okx-demo', data: [] });
+    await expect(assertTradingEnvironment(cli.runner, 'demo')).resolves.toBeUndefined();
+  });
+
+  it('refuses a live profile when demo was requested', async () => {
+    const cli = new FakeCli().on('--env account balance', { env: 'live', profile: 'okx-sub', data: [] });
+    await expect(assertTradingEnvironment(cli.runner, 'demo')).rejects.toThrow(/expected demo/);
+  });
 });
 
 describe('minor-unit conversion', () => {

@@ -9,6 +9,12 @@ function numberAfter(flag: string, fallback: number): number {
   return raw === undefined ? fallback : Number(raw);
 }
 
+function stringAfter(flag: string, fallback: string): string {
+  const index = process.argv.indexOf(flag);
+  const raw = index >= 0 ? process.argv[index + 1] : undefined;
+  return raw ?? fallback;
+}
+
 function pct(value: number): string {
   return `${(value * 100).toFixed(2)}%`;
 }
@@ -16,19 +22,32 @@ function pct(value: number): string {
 async function main(): Promise<void> {
   const path = process.argv.find((arg) => !arg.startsWith('-') && arg.endsWith('.json')) ?? 'var/backtest/okx-90d.json';
   const dataset = loadReplayDataset(path);
+  const strategy = stringAfter('--strategy', 'breakout');
+  if (
+    strategy !== 'breakout' && strategy !== 'major-macd' && strategy !== 'major-macd-long' &&
+    strategy !== 'major-pullback' && strategy !== 'major-breakout'
+  ) {
+    throw new Error('--strategy must be breakout, major-macd, major-macd-long, major-pullback, or major-breakout');
+  }
   const result = replay({
     config: loadConfig('config/default.yaml'),
     dataset,
+    strategy,
+    ...(strategy === 'major-macd' || strategy === 'major-macd-long' || strategy === 'major-pullback' || strategy === 'major-breakout'
+      ? { fourHourHistoryBars: 260 }
+      : {}),
     tradingFeeRateFraction: numberAfter('--maker-bps', 2) / 10_000,
     slippageBps: numberAfter('--slippage-bps', 0),
     respectCompetitionClock: process.argv.includes('--competition-clock'),
   });
 
   console.log(`range ${new Date(result.fromMs).toISOString()} → ${new Date(result.toMs).toISOString()} (${result.observedDays.toFixed(1)}d)`);
+  console.log(`strategy ${strategy}`);
   console.log(`equity ${result.initialEquityUsdt.toFixed(2)} → ${result.finalEquityUsdt.toFixed(2)} USDT (${pct(result.returnFraction)})`);
   console.log(`trades ${result.closedTrades} closed / ${result.entries} entries (${result.tradesPerDay.toFixed(2)}/day)`);
   console.log(`win rate ${pct(result.winRate)} (${result.wins}W/${result.losses}L/${result.scratches} scratch)`);
   console.log(`realised payoff ratio ${Number.isFinite(result.realisedPayoffRatio) ? result.realisedPayoffRatio.toFixed(2) : '∞'}:1`);
+  console.log(`profit factor ${Number.isFinite(result.profitFactor) ? result.profitFactor.toFixed(2) : '∞'}`);
   console.log(`max drawdown ${pct(result.maxDrawdownFraction)} · time stops ${pct(result.timeStopHitRate)}`);
   console.log(`costs fees ${result.totalTradingFeesUsdt.toFixed(4)} measured-assumption · funding ${result.totalFundingUsdt.toFixed(4)} modelled`);
   console.log(`max observed leverage ${result.maximumObservedLeverage.toFixed(2)}x · favourable regime ${result.regimeFavourableCycles}/${result.scanCycles} cycles`);

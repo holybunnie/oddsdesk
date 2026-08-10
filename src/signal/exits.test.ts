@@ -13,7 +13,9 @@ import {
   type PositionState,
 } from './exits.js';
 
-const config = loadConfig('config/default.yaml');
+const loadedConfig = loadConfig('config/default.yaml');
+const config = { ...loadedConfig, strategy: { mode: 'legacy-cross-sectional' as const } };
+const frozenConfig = { ...loadedConfig, strategy: { mode: 'frozen-short-continuation' as const } };
 const NOW = 1_760_000_000_000;
 const HOUR = 3_600_000;
 
@@ -68,12 +70,12 @@ describe('initial stop placement', () => {
   it('scales with ATR rather than a fixed percentage', () => {
     // Same 2x ATR multiple, very different instruments — this is what makes the
     // two stops equivalent RISK rather than equivalent-looking numbers.
-    expect(initialStopFor(config, 'long', 100, 5)).toBeCloseTo(90, 10);
-    expect(initialStopFor(config, 'long', 60_000, 900)).toBeCloseTo(58_200, 10);
+    expect(initialStopFor(config, 'long', 100, 5)).toBeCloseTo(87.5, 10);
+    expect(initialStopFor(config, 'long', 60_000, 900)).toBeCloseTo(57_750, 10);
   });
 
   it('places a short stop above entry', () => {
-    expect(initialStopFor(config, 'short', 100, 5)).toBeCloseTo(110, 10);
+    expect(initialStopFor(config, 'short', 100, 5)).toBeCloseTo(112.5, 10);
   });
 
   it('refuses a non-positive ATR', () => {
@@ -144,9 +146,30 @@ describe('stop hit is terminal', () => {
   });
 });
 
+describe('frozen continuation exits', () => {
+  it('holds through ordinary profit without scaling or trailing', () => {
+    expect(evaluateExit(frozenConfig, short(), market({ lastPrice: 80 })).actions).toEqual([{ kind: 'hold' }]);
+  });
+
+  it('closes the intact position at 3R', () => {
+    expect(evaluateExit(frozenConfig, short(), market({ lastPrice: 70 })).actions[0]).toMatchObject({
+      kind: 'close_full',
+      reason: expect.stringContaining('target'),
+    });
+  });
+
+  it('closes at the frozen 168-hour maximum hold', () => {
+    const position = short({ openedAtMs: NOW - 168 * HOUR });
+    expect(evaluateExit(frozenConfig, position, market()).actions[0]).toMatchObject({
+      kind: 'close_full',
+      reason: expect.stringContaining('168h'),
+    });
+  });
+});
+
 describe('time stop', () => {
-  it('closes a trade that has not reached +1R in the window', () => {
-    const stale = long({ openedAtMs: NOW - 13 * HOUR });
+  it('closes a trade that has not reached +0.5R in the 48h window', () => {
+    const stale = long({ openedAtMs: NOW - 49 * HOUR });
     const plan = evaluateExit(config, stale, market({ lastPrice: 104 })); // +0.4R
     const action = plan.actions[0];
     if (action?.kind !== 'close_full') throw new Error('expected a full close');
@@ -171,15 +194,13 @@ describe('scale-out and breakeven at +2R', () => {
     expect(kinds(long(), market({ lastPrice: 110, highestHighSinceEntry: 110 }))).toEqual(['hold']);
   });
 
-  it('takes 25% off and moves the stop to breakeven at +2R', () => {
+  it('takes 15% off at +2R without moving the stop to breakeven', () => {
     const plan = evaluateExit(config, long(), market({ lastPrice: 120, highestHighSinceEntry: 120 }));
     const scale = plan.actions.find((a) => a.kind === 'scale_out');
     if (scale?.kind !== 'scale_out') throw new Error('expected a scale-out');
 
-    // 25%, not 50%: the entire expectancy is in the tail, and scaling out
-    // heavily amputates the trade that wins.
-    expect(scale.fraction).toBeCloseTo(0.25, 10);
-    expect(plan.actions.some((a) => a.kind === 'move_stop')).toBe(true);
+    expect(scale.fraction).toBeCloseTo(0.15, 10);
+    expect(plan.actions.some((a) => a.kind === 'move_stop' && a.to === 100)).toBe(false);
   });
 
   it('scales out only once', () => {
@@ -187,12 +208,12 @@ describe('scale-out and breakeven at +2R', () => {
     expect(kinds(already, market({ lastPrice: 125, highestHighSinceEntry: 125 }))).not.toContain('scale_out');
   });
 
-  it('never leaves the stop below breakeven once past +2R', () => {
+  it('lets the Chandelier, not breakeven, set the ratchet at +2R', () => {
     const plan = evaluateExit(config, long(), market({ lastPrice: 120, highestHighSinceEntry: 120 }));
     const moves = plan.actions.filter((a) => a.kind === 'move_stop');
     for (const move of moves) {
       if (move.kind !== 'move_stop') continue;
-      expect(move.to).toBeGreaterThanOrEqual(100);
+      expect(move.to).not.toBe(100);
     }
   });
 });
@@ -212,9 +233,8 @@ describe('trailing', () => {
     expect(move.to).toBeCloseTo(120, 10);
   });
 
-  it('switches to the tightened multiple exactly at +4R', () => {
-    // +4R at price 140 → tightened 2.5x ATR: 140 - 12.5 = 127.5. The boundary
-    // is inclusive, so a trade sitting exactly on it gets the tighter trail.
+  it('holds the 3x ATR multiple at +4R instead of tightening', () => {
+    // +4R at price 140 → 3x ATR: 140 - 15 = 125.
     const running = long({ scaledOut: true, currentStop: 100 });
     const plan = evaluateExit(
       config,
@@ -223,7 +243,7 @@ describe('trailing', () => {
     );
     const move = plan.actions.find((a) => a.kind === 'move_stop');
     if (move?.kind !== 'move_stop') throw new Error('expected a stop move');
-    expect(move.to).toBeCloseTo(127.5, 10);
+    expect(move.to).toBeCloseTo(125, 10);
   });
 
   it('reports a stop as hit only when price reaches it', () => {
@@ -233,7 +253,7 @@ describe('trailing', () => {
   });
 
   it('tightens to 2.5x ATR past +4R', () => {
-    // +5R at price 150, high 150, ATR 5 → tightened chandelier at 150 - 12.5.
+    // +5R at price 150, high 150, ATR 5 → unchanged 3x chandelier at 135.
     const running = long({ scaledOut: true, currentStop: 120 });
     const plan = evaluateExit(
       config,
@@ -242,7 +262,7 @@ describe('trailing', () => {
     );
     const move = plan.actions.find((a) => a.kind === 'move_stop');
     if (move?.kind !== 'move_stop') throw new Error('expected a stop move');
-    expect(move.to).toBeCloseTo(137.5, 10);
+    expect(move.to).toBeCloseTo(135, 10);
   });
 
   it('holds the stop through a pullback rather than loosening it', () => {
@@ -273,8 +293,8 @@ describe('trailing', () => {
     );
     const move = plan.actions.find((a) => a.kind === 'move_stop');
     if (move?.kind !== 'move_stop') throw new Error('expected a stop move');
-    // +4R short → tightened 2.5x ATR above the low: 60 + 12.5.
-    expect(move.to).toBeCloseTo(72.5, 10);
+    // +4R short → unchanged 3x ATR above the low: 60 + 15.
+    expect(move.to).toBeCloseTo(75, 10);
   });
 });
 

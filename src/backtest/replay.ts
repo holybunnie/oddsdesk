@@ -44,6 +44,14 @@ import {
   takeExtremes,
   type Direction,
 } from '../signal/scanner.js';
+import {
+  evaluateMajorEntry,
+  evaluateMajorBreakoutEntry,
+  evaluateMajorPullbackEntry,
+  majorBreakoutDirection,
+  majorPullbackDirection,
+  majorSignal,
+} from '../signal/major.js';
 import { assertAboveEligibilityFloor, computeSize, determineStage, type OpenRisk } from '../risk.js';
 import { correlationGroupFor } from '../engine/loop.js';
 
@@ -58,6 +66,9 @@ export interface ReplayInstrument {
   readonly spreadBps: number;
   readonly candles1h: readonly Candle[];
   readonly candles4h: readonly Candle[];
+  /** Optional Binance USDⓈ-M candles used only by research signal features. */
+  readonly binanceCandles1h?: readonly Candle[];
+  readonly binanceCandles4h?: readonly Candle[];
   readonly funding?: readonly FundingPoint[];
   /** Used only when no funding history was recorded for this instrument. */
   readonly defaultFundingRate?: number;
@@ -86,6 +97,8 @@ export interface ReplayOptions {
   readonly slippageBps?: number;
   /** Apply the competition clock. Disabled by default for a rolling historical study. */
   readonly respectCompetitionClock?: boolean;
+  /** Offline candidate strategy. The default preserves the production path. */
+  readonly strategy?: 'breakout' | 'major-macd' | 'major-macd-long' | 'major-pullback' | 'major-breakout';
 }
 
 export interface ReplayTrade {
@@ -128,8 +141,10 @@ export interface ReplayResult {
   readonly losses: number;
   readonly scratches: number;
   readonly winRate: number;
-  /** Sum of winning trade net PnL divided by absolute losing trade net PnL. */
+  /** Average winning trade net PnL divided by absolute average losing trade net PnL. */
   readonly realisedPayoffRatio: number;
+  /** Sum of winning trade net PnL divided by absolute sum of losing trade net PnL. */
+  readonly profitFactor: number;
   readonly averageNetPnlUsdt: number;
   readonly tradesPerDay: number;
   readonly timeStopHitRate: number;
@@ -228,6 +243,8 @@ export function validateReplayDataset(dataset: ReplayDataset): void {
     }
     validateCandles(instrument.instId, instrument.candles1h, '1h');
     validateCandles(instrument.instId, instrument.candles4h, '4h');
+    if (instrument.binanceCandles1h !== undefined) validateCandles(instrument.instId, instrument.binanceCandles1h, 'Binance 1h');
+    if (instrument.binanceCandles4h !== undefined) validateCandles(instrument.instId, instrument.binanceCandles4h, 'Binance 4h');
     let previousFunding = -Infinity;
     for (const point of instrument.funding ?? []) {
       if (!Number.isFinite(point.timestampMs) || !Number.isFinite(point.fundingRate)) {
@@ -263,6 +280,8 @@ export function loadReplayDataset(path: string): ReplayDataset {
     const spec = row.spec as InstrumentSpec;
     const candles1h = row.candles1h as Candle[];
     const candles4h = row.candles4h as Candle[];
+    const binanceCandles1h = row.binanceCandles1h as Candle[] | undefined;
+    const binanceCandles4h = row.binanceCandles4h as Candle[] | undefined;
     if (typeof row.instId !== 'string' || typeof row.spreadBps !== 'number') {
       throw new ReplayError(`replay instrument ${index} is missing instId or spreadBps`);
     }
@@ -275,6 +294,8 @@ export function loadReplayDataset(path: string): ReplayDataset {
       spreadBps: row.spreadBps,
       candles1h,
       candles4h,
+      ...(Array.isArray(binanceCandles1h) ? { binanceCandles1h } : {}),
+      ...(Array.isArray(binanceCandles4h) ? { binanceCandles4h } : {}),
       funding: (row.funding as FundingPoint[] | undefined) ?? [],
       ...(typeof row.defaultFundingRate === 'number' ? { defaultFundingRate: row.defaultFundingRate } : {}),
     } satisfies ReplayInstrument;
@@ -385,7 +406,6 @@ function fillPending(
   config: Config,
   atMs: number,
   barById: ReadonlyMap<string, Candle>,
-  cooldowns: ReadonlyMap<string, number>,
   equityUsdt: number,
   feeRate: number,
   slippageBps: number,
@@ -403,9 +423,6 @@ function fillPending(
       if (atMs > order.candidate.validUntilMs) pending.delete(instId);
       continue;
     }
-    const cooldown = cooldowns.get(instId);
-    if (cooldown !== undefined && atMs < cooldown) continue;
-
     const bar = barById.get(instId);
     const instrument = instrumentById.get(instId);
     if (bar === undefined || instrument === undefined) continue;
@@ -608,8 +625,8 @@ function managePosition(
     }
   }
 
-  // A scale-out can move the stop to breakeven on the same bar. If that new
-  // stop was crossed after the favourable trigger, the remainder closes too.
+  // A scale-out or Chandelier move can update the stop on the same bar. If that
+  // new stop was crossed after the favourable trigger, the remainder closes too.
   const newStopHit = position.side === 'long' ? bar.low <= position.currentStop : bar.high >= position.currentStop;
   if (newStopHit) {
     cashDelta += applyClose(
@@ -643,6 +660,12 @@ function scanAt(
   atMs: number,
   cooldowns: ReadonlyMap<string, number>,
 ): ScanSnapshot {
+  if (
+    options.strategy === 'major-macd' || options.strategy === 'major-macd-long' ||
+    options.strategy === 'major-pullback' || options.strategy === 'major-breakout'
+  ) {
+    return scanMajorAt(options, instruments, atMs, cooldowns);
+  }
   const { config } = options;
   const oneHour = options.oneHourHistoryBars ?? DEFAULT_1H_HISTORY;
   const fourHour = options.fourHourHistoryBars ?? DEFAULT_4H_HISTORY;
@@ -719,6 +742,64 @@ function scanAt(
     if (result.accepted) candidates.push(result.candidate);
   }
   return { candidates, regimeFavourable, universeSize: ranked.length, lastPrices, atrByInstrument: atrById, fundingRates: fundingById };
+}
+
+function scanMajorAt(
+  options: ReplayOptions,
+  instruments: readonly ReplayInstrument[],
+  atMs: number,
+  cooldowns: ReadonlyMap<string, number>,
+): ScanSnapshot {
+  const { config } = options;
+  const oneHour = options.oneHourHistoryBars ?? DEFAULT_1H_HISTORY;
+  const fourHour = options.fourHourHistoryBars ?? 260;
+  const candidates: EntryCandidate[] = [];
+  const lastPrices = new Map<string, number>();
+  const atrById = new Map<string, number>();
+  const fundingById = new Map<string, number>();
+  let priced = 0;
+
+  for (const instrument of instruments) {
+    const candles1h = completedSeries(instrument.candles1h, atMs, HOUR_MS, oneHour);
+    const candles4h = completedSeries(instrument.candles4h, atMs, FOUR_HOUR_MS, fourHour);
+    const last = candles1h.at(-1);
+    const funding = fundingAt(instrument, atMs);
+    if (last === undefined || funding === undefined || candles1h.length < oneHour || candles4h.length < fourHour) continue;
+
+    try {
+      lastPrices.set(instrument.instId, last.close);
+      atrById.set(instrument.instId, atr(candles1h, config.exits.atrPeriod));
+      fundingById.set(instrument.instId, funding);
+      priced += 1;
+      const direction = options.strategy === 'major-pullback'
+        ? majorPullbackDirection(candles1h, candles4h)
+        : options.strategy === 'major-breakout'
+          ? majorBreakoutDirection(candles1h, candles4h)
+          : majorSignal(candles1h, candles4h).direction;
+      if (direction === undefined || (options.strategy === 'major-macd-long' && direction !== 'long')) continue;
+      const cooldownUntilMs = cooldowns.get(instrument.instId);
+      const result = options.strategy === 'major-pullback'
+        ? evaluateMajorPullbackEntry(config, instrument.instId, direction, candles1h, candles4h, funding, atMs, cooldownUntilMs)
+        : options.strategy === 'major-breakout'
+          ? evaluateMajorBreakoutEntry(config, instrument.instId, direction, candles1h, candles4h, funding, atMs, cooldownUntilMs)
+          : evaluateMajorEntry(config, instrument.instId, direction, candles1h, candles4h, funding, atMs, cooldownUntilMs);
+      if (result.accepted) candidates.push(result.candidate);
+    } catch {
+      // An indicator warm-up or malformed series excludes this instrument for
+      // this cycle, matching the current replay's fail-closed behaviour.
+    }
+  }
+
+  return {
+    // Major mode uses explicit instruments and direction-level indicators; it
+    // does not stand down because a cross-sectional count is small.
+    candidates,
+    regimeFavourable: priced > 0,
+    universeSize: priced,
+    lastPrices,
+    atrByInstrument: atrById,
+    fundingRates: fundingById,
+  };
 }
 
 export function replay(options: ReplayOptions): ReplayResult {
@@ -798,7 +879,6 @@ export function replay(options: ReplayOptions): ReplayResult {
       options.config,
       atMs,
       barById,
-      cooldowns,
       equity,
       feeRate,
       slippageBps,
@@ -853,6 +933,13 @@ export function replay(options: ReplayOptions): ReplayResult {
     'Historical spread comes from each dataset instrument.spreadBps; candle data has no historical order book.',
     'An OHLC bar that hits an existing stop and a favourable trigger is ordered stop-first.',
     options.respectCompetitionClock ? 'The configured competition clock was enforced.' : 'The competition clock was not enforced; this is a rolling strategy study.',
+    options.strategy === 'major-macd' || options.strategy === 'major-macd-long'
+      ? 'Six-major MACD mode: explicit instruments, 4h EMA(20/50) alignment, 1h MACD(12/26/9) crossover, and RSI(14) between 30 and 70.'
+      : options.strategy === 'major-pullback'
+        ? 'Six-major pullback mode: explicit instruments, 4h EMA(20/50) alignment, 1h EMA(20) touch-and-reclaim, and RSI(14) between 30 and 70.'
+        : options.strategy === 'major-breakout'
+          ? 'Six-major breakout mode: explicit instruments, 4h EMA(20/50) alignment, and 1h Donchian(20) breakout.'
+        : 'Cross-sectional mode: E1 universe filter, E2 regime gate, E3 momentum extremes, and E4 breakout entry.',
     options.maxLeverage === undefined ? 'No live maxLeverage cap was assumed; Part IX venue verification remains separate.' : `Backtest maxLeverage cap: ${maxLeverage}x.`,
     feeRate === 0 ? 'Trading fees were excluded; pass the verified maker fee to measure net fee drag.' : `Trading fee assumption: ${(feeRate * 10_000).toFixed(2)} bps per fill.`,
     slippageBps === 0 ? 'Slippage was excluded.' : `Slippage assumption: ${slippageBps.toFixed(2)} bps per fill.`,
@@ -877,7 +964,12 @@ export function replay(options: ReplayOptions): ReplayResult {
     losses: losers.length,
     scratches,
     winRate: trades.length === 0 ? 0 : winners.length / trades.length,
-    realisedPayoffRatio: grossLosers === 0 ? (grossWinners > 0 ? Number.POSITIVE_INFINITY : 0) : grossWinners / grossLosers,
+    realisedPayoffRatio: winners.length === 0
+      ? 0
+      : grossLosers === 0
+      ? (grossWinners > 0 ? Number.POSITIVE_INFINITY : 0)
+      : (grossWinners / winners.length) / (grossLosers / losers.length),
+    profitFactor: grossLosers === 0 ? (grossWinners > 0 ? Number.POSITIVE_INFINITY : 0) : grossWinners / grossLosers,
     averageNetPnlUsdt: trades.length === 0 ? 0 : trades.reduce((sum, trade) => sum + trade.netPnlUsdt, 0) / trades.length,
     tradesPerDay: entries / observedDays,
     timeStopHitRate: trades.length === 0 ? 0 : trades.filter((trade) => trade.exitReason.startsWith('time stop')).length / trades.length,

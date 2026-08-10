@@ -289,9 +289,14 @@ describe('evaluateEntry — rejection', () => {
   });
 
   it('blocks re-entry while the post-stop cooldown is running', () => {
-    const verdict = evaluateEntry(config, inputs({ cooldownUntilMs: NOW + 2 * HOUR }));
+    const verdict = evaluateEntry(config, inputs({ candles1h: flat(60, 100), cooldownUntilMs: NOW + 2 * HOUR }));
     if (verdict.accepted) throw new Error('expected rejection');
     expect(verdict.rejection.reasons.join(' ')).toMatch(/cooldown for another 120 minutes/);
+  });
+
+  it('allows a fresh breakout during the post-stop cooldown', () => {
+    const verdict = evaluateEntry(config, inputs({ cooldownUntilMs: NOW + 2 * HOUR }));
+    expect(verdict.accepted).toBe(true);
   });
 
   it('allows entry once the cooldown has expired', () => {

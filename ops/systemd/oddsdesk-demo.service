@@ -1,0 +1,21 @@
+[Unit]
+Description=Oddsdesk frozen strategy demo engine
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=oddsdesk
+WorkingDirectory=/opt/oddsdesk
+EnvironmentFile=-/etc/oddsdesk/demo.env
+Environment=HOME=/opt/oddsdesk
+Environment=NODE_OPTIONS=--dns-result-order=ipv4first
+ExecStart=/usr/bin/node --import tsx src/scripts/run-engine.ts --demo
+Restart=always
+RestartSec=10
+MemoryMax=400M
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -61,6 +61,27 @@ export interface CliResult {
 /** Injected so the adapter is testable without a venue or credentials. */
 export type CliRunner = (args: readonly string[]) => Promise<CliResult>;
 
+/** Prove the credential profile's environment before constructing a trader. */
+export async function assertTradingEnvironment(runner: CliRunner, expected: 'live' | 'demo'): Promise<void> {
+  const result = await runner(['--env', 'account', 'balance']);
+  if (result.code !== 0) {
+    throw new ExecutionError(VENUE, `environment preflight failed: ${result.stderr.trim() || result.stdout.trim() || '(no output)'}`);
+  }
+  let payload: unknown;
+  try {
+    payload = JSON.parse(result.stdout);
+  } catch (cause) {
+    throw new ExecutionError(VENUE, 'environment preflight returned invalid JSON', { cause });
+  }
+  const env = typeof payload === 'object' && payload !== null ? (payload as { env?: unknown }).env : undefined;
+  if (env !== expected) {
+    throw new ExecutionError(
+      VENUE,
+      `trading profile resolved to ${JSON.stringify(env)}, expected ${expected}; refusing to start`,
+    );
+  }
+}
+
 export interface TradeKitOptions {
   /** CLI profile. The competition account is `okx-sub`; the level-1 main account rejects perps. */
   readonly profile: string;
