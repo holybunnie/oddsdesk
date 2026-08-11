@@ -215,6 +215,19 @@ async function main(): Promise<void> {
           `exits ${report.exits.length} signals ${JSON.stringify(report.signals)}` +
           (report.standDownReason === null ? '' : ` — ${report.standDownReason}`),
       );
+      // Every non-submitted outcome, named. The compact line above reports only
+      // a rejected COUNT, so in live mode a refused signal left no trace of why
+      // — and "generated 1, rejected 1" every cycle is precisely the state that
+      // needs explaining, not tallying.
+      for (const outcome of report.outcomes) {
+        if (outcome.status === 'submitted') {
+          console.log(`[signal] ${outcome.signalId} SUBMITTED venue-order ${outcome.venueOrderId} size ${outcome.size}`);
+        } else if (outcome.status === 'duplicate') {
+          console.log(`[signal] ${outcome.signalId} duplicate — already acted on`);
+        } else {
+          console.log(`[signal] ${outcome.signalId ?? '(unparsed)'} REFUSED — ${outcome.reason}`);
+        }
+      }
     },
   });
 
