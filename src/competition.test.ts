@@ -77,6 +77,7 @@ describe('competition config validation', () => {
       raw({
         startsAt: '2026-08-11T12:00:00+08:00',
         endsAt: '2026-08-25T12:00:00+08:00',
+        entrantName: config.competition.entrantName,
         endgame: config.competition.endgame,
       }),
     );
@@ -90,6 +91,7 @@ describe('competition config validation', () => {
       raw({
         startsAt: '2026-08-11T12:00:00',
         endsAt: '2026-08-25T12:00:00+08:00',
+        entrantName: config.competition.entrantName,
         endgame: config.competition.endgame,
       }),
     );
@@ -101,6 +103,7 @@ describe('competition config validation', () => {
       raw({
         startsAt: '2026-08-25T12:00:00+08:00',
         endsAt: '2026-08-11T12:00:00+08:00',
+        entrantName: config.competition.entrantName,
         endgame: config.competition.endgame,
       }),
     );
@@ -114,6 +117,7 @@ describe('competition config validation', () => {
       raw({
         startsAt: '2026-08-11T12:00:00+08:00',
         endsAt: '2026-08-25T12:00:00+08:00',
+        entrantName: config.competition.entrantName,
         endgame: { noNewEntriesHoursBeforeEnd: 24, closeLosersHoursBeforeEnd: 48, chandelierAtrMultiple: 1.5 },
       }),
     );

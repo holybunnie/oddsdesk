@@ -471,8 +471,16 @@ service**, earliest-created wins, never delete it.
    `SignalPublisher` implementation — the last placeholder in running code.
    Part IV mandates *scheduled* push for the 45 s heartbeat while our engine is
    event-driven, so likely both: autopilot for heartbeat, engine for delivery.
-8. **Subscribing to our own ASP has no build task**, though Part III and
-   tutorial step 5 both require it for copy trading.
+8. **Self-subscription is now an explicit deployment gate.** The previous
+   handoff omitted it even though Part III and tutorial step 5 require a
+   separate buyer session for copy trading. On 2026-08-11 the VPS resolved
+   buyer User `#10743` and created a 72-hour AlphaGate trial with auto-renew
+   disabled. The first attempt stopped before signing/broadcast because the
+   Agentic Wallet had no 15 USDT on XLayer; after funding, the retry succeeded.
+   The resulting buyer subscription is
+   `0xd516a15c5778418e649717c18211a94becea9db9a691da7f3e644d2a6a9457d8`.
+   The provider-side active subscriber is a different buyer and has
+   `copyTrade=0`, so it does not describe this buyer route.
 9. **Competition registration is a second gate** after ASP approval — bind the
    OKX UID, fund ≥300 USDT. Part XIII says only "register early".
 
@@ -1224,3 +1232,40 @@ also not present yet, so the live engine has correctly not been started.
    custody result; watchdog is required only for client-held stops.
 6. Obtain explicit approval before the pending system reboot, then verify SSH,
    systemd, and the other project services after reboot.
+
+## 12. Current VPS verification — 2026-08-11
+
+This section supersedes stale runtime notes above where they describe the VPS
+before the current verification. The read-only check was performed over SSH
+against the documented Lightsail host.
+
+- SSH succeeded as `ubuntu`; remote identity: `ip-172-26-14-25`.
+- `/opt/oddsdesk` is at commit `ab30fad`; the checkout has local/untracked
+  deployment changes and should not be treated as a clean release snapshot.
+- Onchain OS `4.4.9` preflight passed with integrity `ok`.
+- ASP `#10706` (`AlphaGate`) is active and listed as eligible for task
+  recommendations. Its A2A service is `Perpetual Momentum Signals`, priced
+  at `15 USDT / month` with a `3-day` trial.
+- `okx-a2a.service` is active and enabled as a user service; its heartbeat was
+  observed during verification.
+- The system-level `oddsdesk-engine.service` is active and enabled. The
+  system-level demo service is inactive and disabled.
+- The VPS wallet is authenticated and has buyer User `#10743` alongside ASP
+  `#10706`.
+- Buyer-side AlphaGate subscription is now active in its trial period. The
+  successful creation used `useTrial=true`, `autoRenew=0`, normal device
+  routing, and offline replay support. Subscription job ID:
+  `0xd516a15c5778418e649717c18211a94becea9db9a691da7f3e644d2a6a9457d8`.
+- Creation transaction:
+  `0x413c568307b96a7c9bf40d8b51d3ff41bb20e1334354bffb9806cd6468d70122`.
+- AlphaGate has one other active provider-side subscription, but that record
+  belongs to buyer `#1791` and reports `copyTrade=0`; it is not the VPS
+  wallet's self-subscription and does not enable autonomous trading here.
+
+### Buyer-side route now provisioned
+
+The buyer-side AlphaGate trial is provisioned on the VPS and auto-renew is
+off. The buyer-side route is ready to receive AlphaGate perpetual signals on
+the configured devices. The subscription alone still does not authorize
+execution: the first actionable perpetual signal must pass the Trade Kit route
+and an explicit execution amount/cap policy.

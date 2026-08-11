@@ -37,6 +37,7 @@ import { A2aSignalPublisher } from '../publishing/a2a.js';
 import { writeHeartbeat } from '../ops/heartbeat.js';
 import { readRuntimeProfile } from '../ops/runtime-profile.js';
 import { virtualDemoBalanceMinor } from '../ops/demo-balance.js';
+import { readRankCushionFrom } from '../rank/snapshot-source.js';
 
 const HEARTBEAT_INTERVAL_MS = 10_000;
 
@@ -176,9 +177,25 @@ async function main(): Promise<void> {
         : actual;
       return Number(measured) / 1e8;
     },
-    // Stage 3 stays unreachable until the leaderboard parser exists. Returning
-    // null is the honest answer: defending a rank we cannot measure is guessing.
-    readRankCushion: async () => null,
+    // Rank steering reads the snapshot the capture process persists. It never
+    // throws: a missing, stale, or unreadable snapshot — or simply being below
+    // the board's visible top-10 window — yields null, which keeps Stage 3
+    // unreachable. Defending a rank we cannot measure is guessing, but a failed
+    // capture must never stop the engine trading.
+    readRankCushion: async () => {
+      const reading = readRankCushionFrom(config, config.leaderboard.path, Date.now());
+      if (reading.cushion === null && reading.unavailableBecause !== undefined) {
+        console.log(`[rank] steering unavailable — ${reading.unavailableBecause}`);
+      } else if (reading.metrics !== undefined) {
+        const m = reading.metrics;
+        console.log(
+          `[rank] score ${m.myScore.toFixed(1)} (pct #${m.myRankPct}, abs #${m.myRankAbs}) ` +
+            `binding ${m.bindingAxis} gap-to-3 ${(100 * m.gapToRank3Pct).toFixed(2)}%/` +
+            `${m.gapToRank3Abs.toFixed(2)} USDT — cushion ${String(reading.cushion)}`,
+        );
+      }
+      return reading.cushion;
+    },
   });
 
   const driver = new Driver({

@@ -21,6 +21,11 @@ competition:
   startsAt: "2026-08-11T12:00:00+08:00"
   endsAt: "2026-08-25T12:00:00+08:00"
 
+  # Our name on the leaderboard, spelled exactly as the board spells it. Rank
+  # steering finds us by this string; if it is wrong we are simply absent, and
+  # absent is treated as "cannot steer", never as zero.
+  entrantName: "AlphaGate"
+
   # PART X — the endgame, measured back from endsAt.
   #
   # Unrealised PnL counts at the final snapshot, so an open position at the close
@@ -104,6 +109,21 @@ risk:
   # before anyone notices.
   maxFeedStalenessSeconds: 30
   maxLeaderboardStalenessMinutes: 30
+
+  # Margin over rank 4, on BOTH axes, before Stage 3 flips the job from earning
+  # to defending. Stage 3 tightens the drawdown governor hard (halve at 8% from
+  # peak against 18% in Stage 1), so entering it on a flickering third place
+  # would cut risk in response to noise rather than to a position actually held.
+  #
+  # Sized against the real day-1 board, where rank 3 sat at +1.28% / 5.19 USDT
+  # and the field below rank 2 was compressed into fractions of a percent. Five
+  # points of return is a wide margin in that distribution, and 16 USDT is the
+  # same five points expressed on our own 320 Principal Base so the two axes
+  # ask for a consistent amount of daylight.
+  stage3Cushion:
+    pctAheadOfRank3: 0.05
+    absAheadOfRank3: 16.0
+
   reconcileIntervalSeconds: 300
 
 execution:
@@ -396,6 +416,10 @@ killSwitch:
 # stopped us out, exactly when a crash makes a restart likely.
 engineState:
   path: var/engine-state.json
+# Written by `npm run capture-leaderboard`, read by the engine. A missing or
+# stale file degrades rank steering to unavailable; it never stops trading.
+leaderboard:
+  path: var/leaderboard/latest.json
 
 publishing:
   maxSignalChars: 200

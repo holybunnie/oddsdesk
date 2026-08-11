@@ -75,6 +75,14 @@ export const configSchema = z
       .object({
         startsAt: instant,
         endsAt: instant,
+        /**
+         * Our name on the leaderboard, exactly as the board spells it.
+         *
+         * Rank steering finds us by this string and refuses to steer when it
+         * cannot — being absent is never read as a zero, because it far more
+         * often means the name changed than that we lost everything.
+         */
+        entrantName: z.string().min(1),
         endgame: z
           .object({
             noNewEntriesHoursBeforeEnd: positive,
@@ -123,6 +131,16 @@ export const configSchema = z
         minTargetStopRatio: z.number().gte(1),
         maxFeedStalenessSeconds: positive,
         maxLeaderboardStalenessMinutes: positive,
+        /**
+         * Margin over rank 4 required before Stage 3 defends.
+         *
+         * Rank alone flickers, and Stage 3 tightens the drawdown governor
+         * sharply, so entering it on a hair's-breadth third place would cut
+         * risk in response to noise. Both axes must clear.
+         */
+        stage3Cushion: z
+          .object({ pctAheadOfRank3: fraction, absAheadOfRank3: positive })
+          .strict(),
         reconcileIntervalSeconds: positive,
       })
       .strict()
@@ -306,6 +324,8 @@ export const configSchema = z
     ledger: z.object({ path: z.string().min(1) }).strict(),
     killSwitch: z.object({ path: z.string().min(1) }).strict(),
     engineState: z.object({ path: z.string().min(1) }).strict(),
+    /** Where the capture process leaves the latest leaderboard snapshot. */
+    leaderboard: z.object({ path: z.string().min(1) }).strict(),
 
     publishing: z
       .object({
