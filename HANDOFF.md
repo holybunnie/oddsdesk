@@ -11,6 +11,39 @@
   `google`, account `jennycruzzyy@gmail.com`.
 - The ASP daemon was never touched and stayed active throughout.
 
+### Unattended status reporting — read this first when you come back
+
+`alphagate-status.timer` runs `/usr/local/bin/alphagate-status.sh` every 15
+minutes (also 3 min after boot, `Persistent=true`), enabled so it survives
+reboot. It is **read-only** and never touches the engine or the ASP daemon.
+Sources are in `ops/alphagate-status.sh` and `ops/systemd/`.
+
+- **`/opt/oddsdesk/var/status-latest.txt`** — current snapshot: engine, ASP
+  daemon, wallet session, equity, open positions, total `SUBMITTED` orders,
+  refusals in 24h, and the last cycle and signal lines.
+- **`/opt/oddsdesk/var/status-history.log`** — one line per run, capped at 5000
+  lines, so an outage that has since recovered is still visible after the fact.
+
+Session expiry is detected by running the real `agent subscribe-active
+--agent-id 10706` call rather than reading `session.json`, and the snapshot
+prints `ACTION REQUIRED` when it fails. **There is still no off-box alerting**
+(BUILD-SPEC Trap 4 layer (c)) — nothing pages you; the report has to be read.
+
+### The live path is the frozen policy — `minConviction` is dead config there
+
+`runScan` branches on `strategy.mode === 'frozen-short-continuation'` and takes
+`runFrozenContinuationScan`, which **never calls `evaluateEntry`**. So
+`config.signals.minConviction` (read only at `src/signal/entry.ts:248`) has no
+effect in live trading, and lowering it to trade more often would change
+nothing. The frozen path synthesises a conviction value from its own score
+purely to populate the field.
+
+The real gates are the frozen constants: `minAbsoluteScore 0.5`,
+`minDirectionalBreadth 3`/6, `requireBtcAlignment`, on a **4-hour decision
+cadence** (bars close 00/04/08/12/16/20 UTC). A quiet hour is usually the
+cadence, not a fault. `frozen-continuation.ts` states that changing any constant
+creates a new research candidate and must not be done as an operational edit.
+
 ### The dev environment loses the SSH key
 
 `~/.ssh/oddsdesk_ed25519` did **not** survive; the dev container was rebuilt.

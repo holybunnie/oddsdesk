@@ -1,0 +1,7 @@
+[Unit]
+Description=AlphaGate unattended status report (read-only)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/alphagate-status.sh
+TimeoutStartSec=300
