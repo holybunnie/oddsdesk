@@ -21,3 +21,4 @@ var/
 
 # Runtime-discovered venue profiles (Law 1: measured, not committed)
 config/runtime-profile.*.yaml
+var/leaderboard/

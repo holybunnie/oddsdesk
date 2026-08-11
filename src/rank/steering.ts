@@ -83,27 +83,137 @@ export class SteeringUnavailable extends Error {
  * never saw — which then feed sizing. Law 2: it stays unimplemented and throws
  * loudly rather than inventing a field.
  */
-export class ParserNotBuilt extends Error {
-  override readonly name = 'ParserNotBuilt';
-  constructor() {
-    super(
-      'leaderboard parser has not been written. It must be built against the real page once ' +
-        'the competition opens — a parser written against a guessed DOM would feed invented ' +
-        'ranks into sizing decisions.',
-    );
-  }
+export class LeaderboardParseError extends Error {
+  override readonly name = 'LeaderboardParseError';
 }
 
 /**
- * Parse the leaderboard page.
+ * Parse a leaderboard payload.
  *
- * Deliberately unimplemented. When the page exists: parse BOTH metric columns
- * separately for the full field, and throw on any row where either column fails
- * to parse rather than dropping it — a silently shortened field distorts every
- * rank and the attrition rate underneath it.
+ * Built on 2026-08-11 against the real response, not a guessed DOM. The page
+ * renders client-side from `/priapi/v1/wallet/activity/hackathon/rank`, so the
+ * source here is that endpoint's JSON rather than HTML — strictly better than
+ * the scrape Part VII assumed, because there is no layout to shift underneath
+ * us. The envelope is `{code, msg, data: {totalNumber, lastNumber,
+ * hackathonAspRank: [{id, name, profit, returnRate, ...}]}}`, where `profit` is
+ * absolute PnL as a decimal string and `returnRate` is already a fraction.
+ *
+ * Throws on any row where either metric fails to parse rather than dropping it.
+ * A silently shortened field distorts every rank and the attrition rate
+ * underneath it, and it would do so invisibly.
  */
-export function parseLeaderboard(_html: string): readonly LeaderboardRow[] {
-  throw new ParserNotBuilt();
+export function parseLeaderboard(raw: string): readonly LeaderboardRow[] {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(raw);
+  } catch (cause) {
+    throw new LeaderboardParseError(`leaderboard payload is not JSON: ${(cause as Error).message}`);
+  }
+
+  if (typeof payload !== 'object' || payload === null) {
+    throw new LeaderboardParseError('leaderboard payload is not an object');
+  }
+  const envelope = payload as { code?: unknown; msg?: unknown; data?: unknown };
+
+  // A non-zero code means the request was rejected. Parsing on regardless would
+  // turn an auth or signing failure into an empty field, which reads as "every
+  // competitor vanished" rather than "we failed to read the page".
+  if (envelope.code !== 0) {
+    throw new LeaderboardParseError(
+      `leaderboard endpoint returned code ${String(envelope.code)}: ${String(envelope.msg ?? '')}`,
+    );
+  }
+
+  const data = envelope.data as { hackathonAspRank?: unknown; totalNumber?: unknown } | undefined;
+  const list = data?.hackathonAspRank;
+  if (!Array.isArray(list)) {
+    throw new LeaderboardParseError('leaderboard payload has no hackathonAspRank array');
+  }
+
+  const rows = list.map((entry, index) => {
+    const row = entry as { name?: unknown; profit?: unknown; returnRate?: unknown };
+    const entrant = row.name;
+    if (typeof entrant !== 'string' || entrant.length === 0) {
+      throw new LeaderboardParseError(`row ${index} has no usable entrant name`);
+    }
+    // profit arrives as a decimal string, returnRate as a number already
+    // expressed as a fraction. Both are required; a row missing either cannot
+    // be ranked on the two-axis score.
+    const pnlAbs = typeof row.profit === 'string' ? Number(row.profit) : row.profit;
+    const pnlPct = row.returnRate;
+    if (typeof pnlAbs !== 'number' || !Number.isFinite(pnlAbs)) {
+      throw new LeaderboardParseError(`row ${index} ("${entrant}") has an unparseable profit`);
+    }
+    if (typeof pnlPct !== 'number' || !Number.isFinite(pnlPct)) {
+      throw new LeaderboardParseError(`row ${index} ("${entrant}") has an unparseable returnRate`);
+    }
+    return { entrant, pnlPct, pnlAbs } satisfies LeaderboardRow;
+  });
+
+  if (rows.length === 0) {
+    throw new LeaderboardParseError('leaderboard returned an empty field');
+  }
+
+  return rows;
+}
+
+/**
+ * Parse, and also report how large the field actually is.
+ *
+ * The endpoint only ever serves a top-N window — verified on 2026-08-11, where
+ * it returned 10 rows of a 63-entrant field and neither raising `limit` nor
+ * paging the UI widened it, because the signature covers the URL and the page
+ * never asks for more. So `rows` is the visible podium region, NOT the field.
+ *
+ * That distinction is load-bearing. The visible rows are enough to price the
+ * podium — what return and what dollar figure currently sit at rank 1, 3 and
+ * 10 — which is the actionable half of Part VII. They are NOT enough to compute
+ * our own rank while we sit outside the window, and they cannot measure
+ * attrition, because a top-10 window is all winners by construction.
+ */
+export function parseLeaderboardField(raw: string): {
+  readonly rows: readonly LeaderboardRow[];
+  readonly fieldSize: number;
+  readonly visible: number;
+} {
+  const rows = parseLeaderboard(raw);
+  const data = (JSON.parse(raw) as { data?: { totalNumber?: unknown } }).data;
+  const fieldSize = typeof data?.totalNumber === 'number' ? data.totalNumber : rows.length;
+  return { rows, fieldSize, visible: rows.length };
+}
+
+/** What it currently costs to reach a given rank, on each axis. */
+export interface PodiumTargets {
+  readonly pctAtRank1: number;
+  readonly pctAtRank3: number;
+  readonly pctAtRank10: number | null;
+  readonly absAtRank1: number;
+  readonly absAtRank3: number;
+  readonly absAtRank10: number | null;
+}
+
+/**
+ * Price the podium from a snapshot, without needing our own row.
+ *
+ * `computeMetrics` deliberately refuses to run when we are absent from the
+ * field, because steering off a rank we cannot see would be guessing. But the
+ * podium thresholds are readable regardless of whether we appear, and while we
+ * are outside the top 10 they are the only rank information available — and the
+ * only rank information that sets a target.
+ */
+export function podiumTargets(rows: readonly LeaderboardRow[]): PodiumTargets {
+  if (rows.length === 0) throw new SteeringUnavailable('cannot price the podium from an empty field');
+  const pctDesc = [...rows.map((r) => r.pnlPct)].sort((a, b) => b - a);
+  const absDesc = [...rows.map((r) => r.pnlAbs)].sort((a, b) => b - a);
+  const last = <T,>(values: readonly T[]): T => values[values.length - 1]!;
+  return {
+    pctAtRank1: pctDesc[0]!,
+    pctAtRank3: valueAtRank(pctDesc, 3) ?? last(pctDesc),
+    pctAtRank10: valueAtRank(pctDesc, 10),
+    absAtRank1: absDesc[0]!,
+    absAtRank3: valueAtRank(absDesc, 3) ?? last(absDesc),
+    absAtRank10: valueAtRank(absDesc, 10),
+  };
 }
 
 /** Competition ranks are 1-based and ties share the better rank. */

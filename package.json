@@ -28,11 +28,13 @@
     "continuation-breadth-audit": "node --import tsx src/scripts/continuation-breadth-audit.ts",
     "continuation-direction-audit": "node --import tsx src/scripts/continuation-direction-audit.ts",
     "model-tournament": "node --import tsx src/scripts/model-tournament.ts",
+    "capture-leaderboard": "node --import tsx src/scripts/capture-leaderboard.ts",
     "validate-registration": "node --import tsx src/scripts/validate-registration.ts",
     "watchdog": "node --import tsx src/scripts/watchdog.ts"
   },
   "dependencies": {
     "better-sqlite3": "^11.7.0",
+    "playwright": "^1.49.1",
     "yaml": "^2.6.1",
     "zod": "^3.24.1"
   },

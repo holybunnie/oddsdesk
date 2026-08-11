@@ -1,11 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { loadConfig } from '../config.js';
+import { readFileSync } from 'node:fs';
 import {
-  ParserNotBuilt,
+  LeaderboardParseError,
   SteeringUnavailable,
   assertFresh,
   computeMetrics,
   parseLeaderboard,
+  parseLeaderboardField,
+  podiumTargets,
   topThreeWithCushion,
   type LeaderboardRow,
   type LeaderboardSnapshot,
@@ -26,10 +29,64 @@ const snapshot = (rows: readonly LeaderboardRow[], ageMinutes = 0): LeaderboardS
   rawHtml: '<table><!-- retained for replay --></table>',
 });
 
-describe('parser boundary', () => {
-  it('throws rather than inventing ranks', () => {
-    // Law 2. This test flips to a real parse once the page exists on Aug 11.
-    expect(() => parseLeaderboard('<html></html>')).toThrow(ParserNotBuilt);
+describe('parser', () => {
+  // A real capture of /priapi/v1/wallet/activity/hackathon/rank taken on
+  // 2026-08-11. Law 2: the parser is written against this, never a guessed shape.
+  const fixture = readFileSync(new URL('./__fixtures__/hackathon-rank.json', import.meta.url), 'utf8');
+
+  it('parses both metric axes from the real payload', () => {
+    const rows = parseLeaderboard(fixture);
+    expect(rows).toHaveLength(10);
+
+    const leader = rows[0]!;
+    expect(leader.entrant).toBe('Helios Terminal');
+    expect(leader.pnlPct).toBeCloseTo(0.980927, 6);
+    expect(leader.pnlAbs).toBeCloseTo(299.32, 2);
+
+    // The two axes genuinely disagree in this field — the biggest absolute
+    // profit is not the biggest return — which is the whole reason the score
+    // is two-axis and the binding axis has to be measured.
+    const byPct = [...rows].sort((a, b) => b.pnlPct - a.pnlPct)[0]!;
+    const byAbs = [...rows].sort((a, b) => b.pnlAbs - a.pnlAbs)[0]!;
+    expect(byPct.entrant).not.toBe(byAbs.entrant);
+  });
+
+  it('reports the visible window separately from the true field size', () => {
+    // The endpoint serves a top-10 window on a 63-entrant field. Conflating the
+    // two would let a 10-row read masquerade as the whole competition.
+    const { rows, fieldSize, visible } = parseLeaderboardField(fixture);
+    expect(rows).toHaveLength(10);
+    expect(visible).toBe(10);
+    expect(fieldSize).toBe(63);
+  });
+
+  it('prices the podium without needing our own row', () => {
+    const { rows } = parseLeaderboardField(fixture);
+    const targets = podiumTargets(rows);
+    // Third place on the percentage axis is what a podium finish actually
+    // costs — an order of magnitude below the leader's number.
+    expect(targets.pctAtRank1).toBeCloseTo(0.980927, 6);
+    expect(targets.pctAtRank3).toBeCloseTo(0.06628414, 6);
+    expect(targets.absAtRank3).toBeCloseTo(71.18, 2);
+    expect(targets.pctAtRank3).toBeLessThan(targets.pctAtRank1 / 10);
+  });
+
+  it('refuses a rejected request rather than reading it as an empty field', () => {
+    const rejected = JSON.stringify({ code: 50113, msg: 'incorrect request sign parameters' });
+    expect(() => parseLeaderboard(rejected)).toThrow(LeaderboardParseError);
+    expect(() => parseLeaderboard(rejected)).toThrow(/50113/);
+  });
+
+  it('refuses a row missing either metric', () => {
+    const broken = JSON.stringify({
+      code: 0,
+      data: { totalNumber: 1, hackathonAspRank: [{ name: 'x', profit: '1.0' }] },
+    });
+    expect(() => parseLeaderboard(broken)).toThrow(/unparseable returnRate/);
+  });
+
+  it('refuses non-JSON', () => {
+    expect(() => parseLeaderboard('<html></html>')).toThrow(LeaderboardParseError);
   });
 });
 
