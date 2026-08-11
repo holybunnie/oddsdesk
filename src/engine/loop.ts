@@ -109,6 +109,13 @@ export interface ScanResult {
   readonly fundingRates: ReadonlyMap<string, number>;
   /** Freshness of the feeds this scan depended on. Passed straight to the guard. */
   readonly feeds: readonly FeedFreshness[];
+  /**
+   * The policy's own account of why it produced no candidate, when it can give
+   * one. A bare "regime unfavourable" cannot distinguish "BTC points the wrong
+   * way" from "breadth is one short" from "nothing cleared the score floor",
+   * and those call for entirely different operator responses.
+   */
+  readonly policyReason?: string;
 }
 
 export interface EngineDeps {
@@ -297,7 +304,11 @@ export class Engine {
         return await standDown('kill switch is tripped for routeB');
       }
       if (!scan.regimeFavourable) {
-        return await standDown('regime unfavourable — the engine stands down');
+        return await standDown(
+          scan.policyReason === undefined
+            ? 'regime unfavourable — the engine stands down'
+            : `regime unfavourable (${scan.policyReason}) — the engine stands down`,
+        );
       }
 
       const outcomes = await this.#takeEntries(scan, equity, stage, cycle, nowMs);

@@ -21,7 +21,22 @@ export const FROZEN_MAJOR_INST_IDS = [
 
 export const FROZEN_CONTINUATION_POLICY = Object.freeze({
   decisionIntervalHours: 4,
-  direction: 'short' as const,
+  /**
+   * Promoted to 'both' on 2026-08-11 as a declared exception to the promotion
+   * gate, recorded so it can be reverted by changing this one value.
+   *
+   * The bidirectional arm REJECTED on the gate (PF 1.08, 3/5 positive folds) —
+   * but so does the short-only incumbent when the same gate is turned on it
+   * (PF 1.09, 2/5 positive folds, and it FAILS fold-concentration because all
+   * of its profit comes from two of five windows). With no arm passing, the
+   * tie-break is structural rather than statistical: short-only's hard gate was
+   * measured shut for up to 47.8 continuous days against a 14-day competition
+   * window, while the bidirectional gate is open 93.7% of the time with a
+   * worst idle stretch of 3.2 days. A policy that cannot trade cannot rank.
+   *
+   * Set back to 'short' to restore the original frozen policy exactly.
+   */
+  direction: 'both' as 'short' | 'long' | 'both',
   minAbsoluteScore: 0.5,
   minDirectionalBreadth: 3,
   requireBtcAlignment: true,
@@ -42,11 +57,20 @@ export interface FrozenMarketState {
   readonly binanceCandles4h: readonly Candle[];
 }
 
+export type FrozenTrend = 'long' | 'short' | 'mixed';
+
 export interface FrozenDecision {
   readonly candidate?: EntryCandidate;
   readonly reason: string;
   readonly scores: ReadonlyMap<string, number>;
-  readonly shortBreadth: number;
+  /**
+   * Majors whose dual-venue 4h trend agrees with BTC. Named directionally
+   * because the policy is no longer short-only; it is the count that the
+   * `minDirectionalBreadth` floor is applied to, whichever way BTC points.
+   */
+  readonly directionalBreadth: number;
+  /** The direction BTC licensed this cycle, or 'mixed' when the venues disagree. */
+  readonly trend: FrozenTrend;
   readonly regimeFavourable: boolean;
 }
 
@@ -63,9 +87,17 @@ function logReturn(candles: readonly Candle[], bars: number): number {
   return Math.log(candles.at(-1)!.close / candles[candles.length - bars - 1]!.close);
 }
 
-function shortTrend(state: FrozenMarketState): boolean {
-  return ema(state.candles4h, 20) < ema(state.candles4h, 50)
-    && ema(state.binanceCandles4h, 20) < ema(state.binanceCandles4h, 50);
+/**
+ * Dual-venue 4h trend. Both venues must agree or the instrument is 'mixed' and
+ * counts toward neither side — the same conservatism the short-only policy had,
+ * applied symmetrically rather than only to the short case.
+ */
+function trendOf(state: FrozenMarketState): FrozenTrend {
+  const okxShort = ema(state.candles4h, 20) < ema(state.candles4h, 50);
+  const binanceShort = ema(state.binanceCandles4h, 20) < ema(state.binanceCandles4h, 50);
+  if (okxShort && binanceShort) return 'short';
+  if (!okxShort && !binanceShort) return 'long';
+  return 'mixed';
 }
 
 function score(state: FrozenMarketState): number {
@@ -77,12 +109,19 @@ function score(state: FrozenMarketState): number {
     + 0.15 * logReturn(state.binanceCandles1h, 72) / binanceVol;
 }
 
-function continuation(state: FrozenMarketState): boolean {
+/**
+ * The continuation bar, mirrored. Short takes a down bar closing below EMA(20)
+ * with Binance agreeing; long is the exact reflection. The asymmetry that used
+ * to live here was the direction constant, not the geometry.
+ */
+function continuation(state: FrozenMarketState, direction: 'long' | 'short'): boolean {
   const current = state.candles1h.at(-1)!;
   const previous = state.candles1h.at(-2)!;
-  return current.close < previous.close
-    && current.close < ema(state.candles1h, FROZEN_CONTINUATION_POLICY.continuationEma)
-    && logReturn(state.binanceCandles1h, 1) < 0;
+  const continuationEma = ema(state.candles1h, FROZEN_CONTINUATION_POLICY.continuationEma);
+  const binanceLastReturn = logReturn(state.binanceCandles1h, 1);
+  return direction === 'short'
+    ? current.close < previous.close && current.close < continuationEma && binanceLastReturn < 0
+    : current.close > previous.close && current.close > continuationEma && binanceLastReturn > 0;
 }
 
 export function evaluateFrozenContinuation(
@@ -90,43 +129,76 @@ export function evaluateFrozenContinuation(
   nowMs: number,
   cooldowns: ReadonlyMap<string, number> = new Map(),
 ): FrozenDecision {
+  const empty = { scores: new Map<string, number>(), directionalBreadth: 0, trend: 'mixed' as const, regimeFavourable: false };
   const byId = new Map(states.map((state) => [state.instId, state]));
   for (const instId of FROZEN_MAJOR_INST_IDS) {
     const state = byId.get(instId);
-    if (state === undefined) return { reason: `missing ${instId}`, scores: new Map(), shortBreadth: 0, regimeFavourable: false };
+    if (state === undefined) return { reason: `missing ${instId}`, ...empty };
     if (state.candles1h.length < 100 || state.candles4h.length < 60 || state.binanceCandles1h.length < 100 || state.binanceCandles4h.length < 60) {
-      return { reason: `insufficient confirmed history for ${instId}`, scores: new Map(), shortBreadth: 0, regimeFavourable: false };
+      return { reason: `insufficient confirmed history for ${instId}`, ...empty };
     }
   }
 
   const scores = new Map(states.map((state) => [state.instId, score(state)]));
-  const shortBreadth = states.filter(shortTrend).length;
-  if (!shortTrend(byId.get('BTC-USDT-SWAP')!)) {
-    return { reason: 'BTC dual-venue 4h trend is not short', scores, shortBreadth, regimeFavourable: false };
+  const btcTrend = trendOf(byId.get('BTC-USDT-SWAP')!);
+  const allowed = FROZEN_CONTINUATION_POLICY.direction;
+
+  // BTC licenses the direction for the cycle. 'mixed' means the two venues
+  // disagree on BTC itself, which is the one case with no defensible side.
+  if (btcTrend === 'mixed') {
+    return { reason: 'BTC dual-venue 4h trend disagrees across venues', scores, directionalBreadth: 0, trend: 'mixed', regimeFavourable: false };
   }
-  if (shortBreadth < FROZEN_CONTINUATION_POLICY.minDirectionalBreadth) {
-    return { reason: `short breadth ${shortBreadth}/6 is below 3/6`, scores, shortBreadth, regimeFavourable: false };
+  if (allowed !== 'both' && allowed !== btcTrend) {
+    return { reason: `BTC dual-venue 4h trend is ${btcTrend}, policy trades ${allowed} only`, scores, directionalBreadth: 0, trend: btcTrend, regimeFavourable: false };
   }
 
+  const direction = btcTrend;
+  const directionalBreadth = states.filter((state) => trendOf(state) === direction).length;
+  if (directionalBreadth < FROZEN_CONTINUATION_POLICY.minDirectionalBreadth) {
+    return {
+      reason: `${direction} breadth ${directionalBreadth}/6 is below ${FROZEN_CONTINUATION_POLICY.minDirectionalBreadth}/6`,
+      scores,
+      directionalBreadth,
+      trend: direction,
+      regimeFavourable: false,
+    };
+  }
+
+  // Score must be extreme in the traded direction: <= -0.5 to short, >= +0.5 to
+  // long. Sorting takes the most extreme candidate either way.
+  const floor = FROZEN_CONTINUATION_POLICY.minAbsoluteScore;
   const chosen = states
-    .filter(shortTrend)
-    .filter(continuation)
-    .filter((state) => (scores.get(state.instId) ?? 0) <= -FROZEN_CONTINUATION_POLICY.minAbsoluteScore)
+    .filter((state) => trendOf(state) === direction)
+    .filter((state) => continuation(state, direction))
+    .filter((state) => {
+      const value = scores.get(state.instId) ?? 0;
+      return direction === 'short' ? value <= -floor : value >= floor;
+    })
     .filter((state) => (cooldowns.get(state.instId) ?? Number.NEGATIVE_INFINITY) <= nowMs)
-    .sort((left, right) => (scores.get(left.instId) ?? 0) - (scores.get(right.instId) ?? 0))[0];
-  if (chosen === undefined) return { reason: 'no score>=0.5 short continuation', scores, shortBreadth, regimeFavourable: true };
+    .sort((left, right) => {
+      const a = scores.get(left.instId) ?? 0;
+      const b = scores.get(right.instId) ?? 0;
+      return direction === 'short' ? a - b : b - a;
+    })[0];
+  if (chosen === undefined) {
+    return { reason: `no score>=${floor} ${direction} continuation`, scores, directionalBreadth, trend: direction, regimeFavourable: true };
+  }
 
   const current = chosen.candles1h.at(-1)!;
   const atrValue = atr(chosen.candles1h, FROZEN_CONTINUATION_POLICY.stopAtrPeriod);
   const risk = FROZEN_CONTINUATION_POLICY.stopAtrMultiple * atrValue;
-  const stopPrice = current.close + risk;
-  const targetPrice = current.close - FROZEN_CONTINUATION_POLICY.targetR * risk;
-  if (targetPrice <= 0) return { reason: `${chosen.instId} target is non-positive`, scores, shortBreadth, regimeFavourable: true };
+  const stopPrice = direction === 'short' ? current.close + risk : current.close - risk;
+  const targetPrice = direction === 'short'
+    ? current.close - FROZEN_CONTINUATION_POLICY.targetR * risk
+    : current.close + FROZEN_CONTINUATION_POLICY.targetR * risk;
+  if (stopPrice <= 0 || targetPrice <= 0) {
+    return { reason: `${chosen.instId} stop or target is non-positive`, scores, directionalBreadth, trend: direction, regimeFavourable: true };
+  }
   const absoluteScore = Math.abs(scores.get(chosen.instId)!);
   return {
     candidate: {
       instId: chosen.instId,
-      direction: 'short',
+      direction,
       breakoutLevel: current.close,
       lastClose: current.close,
       entryBandLow: current.close,
@@ -145,9 +217,10 @@ export function evaluateFrozenContinuation(
       },
       validUntilMs: nowMs + FROZEN_CONTINUATION_POLICY.decisionIntervalHours * 3_600_000,
     },
-    reason: `${chosen.instId} short continuation score ${absoluteScore.toFixed(2)}, breadth ${shortBreadth}/6`,
+    reason: `${chosen.instId} ${direction} continuation score ${absoluteScore.toFixed(2)}, breadth ${directionalBreadth}/6`,
     scores,
-    shortBreadth,
+    directionalBreadth,
+    trend: direction,
     regimeFavourable: true,
   };
 }

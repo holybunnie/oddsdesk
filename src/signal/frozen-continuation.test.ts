@@ -28,6 +28,25 @@ function falling(count: number, stepHours: number): Candle[] {
   return result;
 }
 
+function rising(count: number, stepHours: number): Candle[] {
+  const result = Array.from({ length: count }, (_, index) => {
+    const close = 200 * Math.exp(0.004 * index) * (1 + 0.008 * Math.sin(index * 1.7));
+    return {
+      openTimeMs: NOW - (count - index) * stepHours * HOUR_MS,
+      open: close * 0.998,
+      high: close * 1.01,
+      low: close * 0.99,
+      close,
+      volume: 1_000,
+      quoteVolume: close * 1_000,
+      confirmed: true,
+    } satisfies Candle;
+  });
+  const previous = result.at(-2)!;
+  result[result.length - 1] = { ...result.at(-1)!, close: previous.close * 1.02, high: previous.close * 1.03 };
+  return result;
+}
+
 function states(): FrozenMarketState[] {
   return FROZEN_MAJOR_INST_IDS.map((instId) => ({
     instId,
@@ -38,11 +57,22 @@ function states(): FrozenMarketState[] {
   }));
 }
 
+function longStates(): FrozenMarketState[] {
+  return FROZEN_MAJOR_INST_IDS.map((instId) => ({
+    instId,
+    candles1h: rising(120, 1),
+    candles4h: rising(70, 4),
+    binanceCandles1h: rising(120, 1),
+    binanceCandles4h: rising(70, 4),
+  }));
+}
+
 describe('frozen short continuation', () => {
   it('emits one short with the frozen 2ATR stop and 3R target', () => {
     const decision = evaluateFrozenContinuation(states(), NOW);
     expect(decision.regimeFavourable).toBe(true);
-    expect(decision.shortBreadth).toBe(6);
+    expect(decision.directionalBreadth).toBe(6);
+    expect(decision.trend).toBe('short');
     expect(decision.candidate?.direction).toBe('short');
     const candidate = decision.candidate!;
     const risk = candidate.stopPrice - candidate.entryBandLow;
@@ -50,15 +80,41 @@ describe('frozen short continuation', () => {
     expect(candidate.scaleOutPrice).toBe(candidate.targetPrice);
   });
 
-  it('stands down when BTC is not in a dual-venue short trend', () => {
+  it('emits the mirrored long with the stop below and the target above', () => {
+    const decision = evaluateFrozenContinuation(longStates(), NOW);
+    expect(decision.regimeFavourable).toBe(true);
+    expect(decision.trend).toBe('long');
+    expect(decision.directionalBreadth).toBe(6);
+    expect(decision.candidate?.direction).toBe('long');
+    const candidate = decision.candidate!;
+    expect(candidate.stopPrice).toBeLessThan(candidate.entryBandLow);
+    expect(candidate.targetPrice).toBeGreaterThan(candidate.entryBandLow);
+    const risk = candidate.entryBandLow - candidate.stopPrice;
+    expect(candidate.targetPrice - candidate.entryBandLow).toBeCloseTo(3 * risk, 10);
+  });
+
+  it('stands down on breadth when BTC flips against the rest of the book', () => {
+    // BTC turning up licenses the long side, but the other five majors are
+    // still short, so long breadth is 1/6 and the floor rejects it.
     const input = states();
     const btc = input[0]!;
-    const rising = [...btc.candles4h].reverse().map((candle, index) => ({ ...candle, openTimeMs: btc.candles4h[index]!.openTimeMs }));
-    input[0] = { ...btc, candles4h: rising, binanceCandles4h: rising };
+    input[0] = { ...btc, candles4h: rising(70, 4), binanceCandles4h: rising(70, 4) };
     const decision = evaluateFrozenContinuation(input, NOW);
     expect(decision.regimeFavourable).toBe(false);
     expect(decision.candidate).toBeUndefined();
-    expect(decision.reason).toMatch(/BTC/);
+    expect(decision.trend).toBe('long');
+    expect(decision.reason).toMatch(/breadth 1\/6/);
+  });
+
+  it('stands down when the two venues disagree on BTC itself', () => {
+    const input = states();
+    const btc = input[0]!;
+    input[0] = { ...btc, binanceCandles4h: rising(70, 4) };
+    const decision = evaluateFrozenContinuation(input, NOW);
+    expect(decision.regimeFavourable).toBe(false);
+    expect(decision.candidate).toBeUndefined();
+    expect(decision.trend).toBe('mixed');
+    expect(decision.reason).toMatch(/disagrees across venues/);
   });
 
   it('does not re-emit an instrument during cooldown', () => {
