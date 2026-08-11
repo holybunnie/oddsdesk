@@ -1269,3 +1269,162 @@ off. The buyer-side route is ready to receive AlphaGate perpetual signals on
 the configured devices. The subscription alone still does not authorize
 execution: the first actionable perpetual signal must pass the Trade Kit route
 and an explicit execution amount/cap policy.
+
+## 13. Session 9 — 2026-08-11, competition day 1
+
+**Read this section first. It supersedes everything above where they conflict.**
+
+### One-line state
+
+The engine is live and correct end to end, but **cannot deliver signals because
+the `oddsdesk` service user's wallet session is expired**. That is the only
+blocker. Everything else works.
+
+### The single next action
+
+Complete the wallet login for the **`oddsdesk`** user, signed in as the account
+that owns ASP `#10706` (wallet `0x4c24…0f05`). A different account mints a
+different wallet, which does not own AlphaGate and still cannot publish.
+
+```bash
+# 1. mint a link
+sudo -u oddsdesk env HOME=/opt/oddsdesk \
+  /usr/local/bin/onchainos wallet login --phase init
+
+# 2. START THE POLL BEFORE HANDING OVER THE LINK, and let it retry.
+#    A single poll gives up after ~2 minutes with "login timed out waiting for
+#    the result", which is what defeated four attempts this session. Never wrap
+#    it in a short `timeout`, and never let it die with the SSH connection.
+sudo -u oddsdesk env HOME=/opt/oddsdesk setsid nohup bash -c \
+  'for i in $(seq 10); do /usr/local/bin/onchainos wallet login --phase poll \
+     --session-id <ID> > /tmp/login.log 2>&1; \
+     grep -q "\"ok\":true" /tmp/login.log && break; done' \
+  >/dev/null 2>&1 </dev/null &
+
+# 3. human opens the loginUrl and signs in
+# 4. success check — must return ok:true AND list agent 10706 AlphaGate
+sudo -u oddsdesk env HOME=/opt/oddsdesk \
+  /usr/local/bin/onchainos agent get --page 1 --page-size 50
+```
+
+Signing in on the browser alone does nothing: the `poll` phase is what persists
+the session. `session.json` existing is NOT proof of success — a killed poll
+leaves a stale one. The only proof is `agent get` returning `ok:true`.
+
+After the session is valid, the engine picks it up on its next ~5 minute cycle
+with no restart needed. Watch for `[signal] … SUBMITTED venue-order …`.
+
+### What was wrong, and what was fixed
+
+1. **The policy was short-only and the market was long.** Its hard gate (BTC
+   dual-venue 4h short + breadth >= 3/6) was measured open on only **50.7%** of
+   540-day decision points, with a **longest continuous closed stretch of 47.8
+   days** against a 14-day competition. Now bidirectional: **93.7%** open, worst
+   idle stretch **3.2 days**. Revert by setting
+   `FROZEN_CONTINUATION_POLICY.direction` back to `'short'`.
+   - Declared exception: the bidirectional arm REJECTED on the promotion gate
+     (PF 1.08, 3/5 positive folds) — but so does the short-only incumbent under
+     that same gate (PF 1.09, 2/5, fold-concentration FAIL, all profit from two
+     of five windows). No arm passed, so the tie-break was structural. The
+     incumbent had never been tested against its own bar. Reproduce with
+     `npm run continuation-direction-audit -- var/backtest/majors-540d-exact.json`.
+2. **Every signal was refused at publication, in both directions.** The frozen
+   policy set `scaleOutPrice = targetPrice` (it is a single-target 3R trade) and
+   `validateSignal` demanded TP1 strictly between the entry band and TP2. The
+   short branch had the identical requirement, so **direction was never the
+   blocker** — the policy could never have traded. TP1 is now optional through
+   plan, formatter, gate, parser and entry candidate; a single-target strategy
+   publishes no TP1 at all rather than a TP1 equal to TP2.
+3. **The payoff ratio was refused by rounding.** Prices publish at five
+   significant figures and risk/reward are *differences* of quantised prices, so
+   a policy targeting exactly the 3.0 minimum failed on quantisation alone. The
+   comparison now admits exactly the slack rounding can explain, derived from
+   the magnitudes in hand.
+4. **Rank steering was dead code.** `parseLeaderboard` threw `ParserNotBuilt`
+   and `run-engine` passed a hardcoded `null` cushion, so Stage 3 was
+   unreachable and the binding axis unmeasured — in a module the build spec
+   calls the highest-leverage in the build.
+5. **Two observability holes**: the cycle log discarded the policy's own
+   stand-down reason, and in live mode a refused signal logged only a count with
+   no reason. Both now print. The second is what finally exposed the expired
+   session.
+
+### Leaderboard — now real
+
+`npm run capture-leaderboard` drives a real page and reads its own signed
+response. There is a JSON API at
+`/priapi/v1/wallet/activity/hackathon/rank` (also `/chart`, `/profile`,
+`/status`, `/deadline`) on `www.okx.ai`, but OKX signs requests at runtime with
+an EC client signature and fingerprint token, and **the signature covers the
+URL** — so unauthenticated curl returns `50113`, and rewriting `limit` after the
+app signs is rejected too. Hence the browser. Chromium is installed on the VPS
+for the `oddsdesk` user.
+
+The board exposes a **top-10 window on a 63-entrant field**. That prices the
+podium but cannot give our own rank or the attrition rate until we are inside
+the window, so `computeMetrics` correctly refuses and Stage 3 stays unreachable.
+`podiumTargets` reads the thresholds without needing our row.
+
+**The podium is cheap.** Day-1 readings: rank 1 was +72.65%, but **rank 3 was
++1.28% / 5.19 USDT**, later +1.39% / 13.39 USDT — roughly **+4.2% on our 320
+Principal Base**, with the *dollar* axis binding at our size. Do not conclude
+from the top number that this is unwinnable; that error was made and corrected
+this session. Attrition is violent and real: `Helios Terminal` led at +98.09%
+and left the top ten within the hour; `1M · 斯巴达` went +19.57% -> +5.42%.
+
+### Two identities on the VPS — do not confuse them
+
+| | ASP daemon | Trading engine |
+|---|---|---|
+| unit | `okx-a2a.service` (systemd **--user**) | `oddsdesk-engine.service` (system) |
+| user | `ubuntu` | `oddsdesk` (uid 997, nologin) |
+| HOME | `/home/ubuntu` | **`/opt/oddsdesk`**, not /home/oddsdesk |
+| creds | `/home/ubuntu/.onchainos/` | `/opt/oddsdesk/.onchainos/` |
+
+The ASP daemon's session is healthy and heartbeating. The engine's is not. They
+are separate stores, which is why the ASP is unaffected by engine work.
+
+**The ASP must never go offline** (rule 3.2; deleting its service is
+disqualification under 3.3). It has been continuously active since
+`2026-08-10 15:16:12 UTC` with `NRestarts=0` and linger enabled. Engine
+restarts cannot touch it. Do not "fix" the engine login by copying credentials
+from `ubuntu` — a shared session risks invalidating the daemon's, which is the
+one thing that must not break.
+
+Anything engine-side must be run as:
+`sudo -u oddsdesk env HOME=/opt/oddsdesk <cmd>` — the repo is owned by
+`oddsdesk` and omitting HOME makes `npm ci` fail obscurely. Use
+`/usr/local/bin/onchainos`; `/home/ubuntu/.local/bin/onchainos` is not readable
+by that user.
+
+### Deploy procedure that worked
+
+Stop engine -> `git fetch` + `reset --hard <sha>` as `oddsdesk` -> `npm ci` ->
+typecheck -> vitest -> **dry preflight** -> start. `reset --hard` is safe: the
+runtime profile and `var/` are gitignored and survive. Always run the dry
+preflight (`run-engine.ts` with no flags) — it is what caught the publication
+blocker before any money moved.
+
+### Current live state
+
+- VPS at `c269bba`, engine **active**, `NRestarts=0`, stop custody `venue-held`.
+- Equity **319.90 USDT**, peak 319.90, **no positions, no orders, no trades**.
+- Typecheck and **479 tests** pass locally and on the VPS.
+- Each cycle: generates one candidate, refuses at delivery on the expired
+  session. Example: `S-260811134719-BNB-L`.
+- Observed size: 3.62x leverage on BNB — correct arithmetic for 3% risk against
+  a tight 2xATR stop (0.83% of price), inside the 5x cap, but above the 0.5-2x
+  the spec anticipated at 2% risk. Consequence of the 3% setting, not a bug.
+- Competition rule 3.1: at least one valid trade or the entry is void. Still
+  zero trades.
+
+### Do not repeat these
+
+- Do not conclude the competition is unwinnable from rank 1's number; the
+  target is rank 3's.
+- Do not treat the frozen policy as validated because it is labelled frozen.
+  The promotion gate had only ever been applied to challengers.
+- Do not hot-patch `validateSignal` to force a trade through; it is what makes
+  Law 6 structural.
+- Do not wrap the login poll in a short timeout, and do not trust
+  `session.json` as evidence of a session.
