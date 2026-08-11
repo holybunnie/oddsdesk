@@ -752,7 +752,7 @@ export class Engine {
         entryLow: candidate.entryBandLow,
         entryHigh: candidate.entryBandHigh,
         stopPrice,
-        scaleOutPrice: candidate.scaleOutPrice,
+        ...(candidate.scaleOutPrice === undefined ? {} : { scaleOutPrice: candidate.scaleOutPrice }),
         targetPrice: candidate.targetPrice,
         ...(addIndex === undefined ? {} : { addIndex }),
         sizePercent,

@@ -59,7 +59,8 @@ export interface ParsedSignal {
   readonly entryLow: number;
   readonly entryHigh: number;
   readonly stopPrice: number;
-  readonly scaleOutPrice: number;
+  /** Null when the strategy publishes no scale-out — a single-target signal. */
+  readonly scaleOutPrice: number | null;
   readonly targetPrice: number;
   readonly sizePercent: number;
   /** Absolute expiry, read from the text rather than inferred from delivery. */
@@ -75,7 +76,7 @@ export interface ParsedSignal {
  * make impossible.
  */
 const SIGNAL_PATTERN =
-  /^(\S+) \| (LONG|SHORT) (\d+(?:\.\d+)?)x \| Entry (\d+(?:\.\d+)?)-(\d+(?:\.\d+)?) \| SL (\d+(?:\.\d+)?) \| TP1 (\d+(?:\.\d+)?) \| TP2 (\d+(?:\.\d+)?) \| Position (\d+(?:\.\d+)?)% \| Valid (\S+) \| (?:ADD (\d+) \| )?(\S+)$/;
+  /^(\S+) \| (LONG|SHORT) (\d+(?:\.\d+)?)x \| Entry (\d+(?:\.\d+)?)-(\d+(?:\.\d+)?) \| SL (\d+(?:\.\d+)?) \| (?:TP1 (\d+(?:\.\d+)?) \| )?TP2 (\d+(?:\.\d+)?) \| Position (\d+(?:\.\d+)?)% \| Valid (\S+) \| (?:ADD (\d+) \| )?(\S+)$/;
 
 /** Parse a published entry signal. Throws rather than returning a partial reading. */
 export function parseSignal(config: Config, text: string): ParsedSignal {
@@ -121,7 +122,7 @@ export function parseSignal(config: Config, text: string): ParsedSignal {
     entryLow: Number(entryLow),
     entryHigh: Number(entryHigh),
     stopPrice: Number(stopPrice),
-    scaleOutPrice: Number(scaleOutPrice),
+    scaleOutPrice: scaleOutPrice === undefined ? null : Number(scaleOutPrice),
     targetPrice: Number(targetPrice),
     sizePercent: Number(sizePercent),
     validUntilMs,
@@ -348,7 +349,7 @@ export class CopyExecutor {
       entryLow: parsed.entryLow,
       entryHigh: parsed.entryHigh,
       stopPrice: parsed.stopPrice,
-      scaleOutPrice: parsed.scaleOutPrice,
+      ...(parsed.scaleOutPrice === null ? {} : { scaleOutPrice: parsed.scaleOutPrice }),
       targetPrice: parsed.targetPrice,
       sizePercent: parsed.sizePercent,
       validUntilMs: parsed.validUntilMs,

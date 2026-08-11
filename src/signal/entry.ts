@@ -46,8 +46,14 @@ export interface EntryCandidate {
   readonly entryBandLow: number;
   readonly entryBandHigh: number;
   readonly stopPrice: number;
-  /** TP1 — where E5 takes the configured small scale-out at +`scaleOutAtR`R. */
-  readonly scaleOutPrice: number;
+  /**
+   * TP1 — where E5 takes the configured small scale-out at +`scaleOutAtR`R.
+   *
+   * Absent for single-target strategies. The frozen continuation policy runs one
+   * 3R target with no partial, and publishing a TP1 it never acts on would be
+   * the published-vs-actual divergence this field exists to prevent.
+   */
+  readonly scaleOutPrice?: number;
   /** TP2 — the screening target, at the minimum payoff ratio NET of carry. */
   readonly targetPrice: number;
   /** Expected funding paid over the hold, as a fraction of notional. */

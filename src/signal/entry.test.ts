@@ -422,7 +422,7 @@ describe('entry geometry and publication', () => {
       entryLow: c.entryBandLow,
       entryHigh: c.entryBandHigh,
       stopPrice: c.stopPrice,
-      scaleOutPrice: c.scaleOutPrice,
+      ...(c.scaleOutPrice === undefined ? {} : { scaleOutPrice: c.scaleOutPrice }),
       targetPrice: c.targetPrice,
       sizePercent: 1,
       validUntilMs: NOW + HOUR,

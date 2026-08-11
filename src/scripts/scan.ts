@@ -106,7 +106,7 @@ async function main(): Promise<void> {
     console.log(`  ENTRY ${symbol} ${c.direction.padEnd(5)} conviction ${c.conviction.total.toFixed(1)}`);
     console.log(
       `         band ${fmt(c.entryBandLow)} - ${fmt(c.entryBandHigh)}  ` +
-        `stop ${fmt(c.stopPrice)}  TP1 ${fmt(c.scaleOutPrice)}  TP2 ${fmt(c.targetPrice)}  ` +
+        `stop ${fmt(c.stopPrice)}  ${c.scaleOutPrice === undefined ? '' : `TP1 ${fmt(c.scaleOutPrice)}  `}TP2 ${fmt(c.targetPrice)}  ` +
         `(broke ${fmt(c.breakoutLevel)}, atr ${fmt(c.atr)})`,
     );
     if (c.expectedFundingCostFraction > 0) {

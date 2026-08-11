@@ -42,8 +42,15 @@ export interface SignalPlan {
    * and trails the remainder. So the published intent and the actual behaviour
    * diverged on every winning trade, which is what an auditor comparing signals
    * to fills would see first.
+   *
+   * OPTIONAL, because not every strategy has a scale-out. The frozen
+   * continuation policy is a single-target 3R trade: it has no +2R partial, so
+   * publishing a TP1 at all would describe an order it never places. When this
+   * is absent the text omits TP1 entirely rather than publishing TP1 == TP2,
+   * which would tell a subscriber to scale out exactly at the target — the same
+   * class of published-vs-actual divergence this field was introduced to end.
    */
-  readonly scaleOutPrice: number;
+  readonly scaleOutPrice?: number;
   /**
    * TP2 — the screening target at `minTargetStopRatio`.
    *
@@ -128,6 +135,20 @@ export function roundPrice(value: number): number {
   return Number(value.toPrecision(PRICE_SIGNIFICANT_FIGURES));
 }
 
+/**
+ * The largest amount `roundPrice` can have moved a value.
+ *
+ * Half a unit in the last significant place. Used to size the payoff-ratio
+ * tolerance from the real magnitudes rather than a guessed constant, so the
+ * slack shrinks automatically if the published precision is ever raised.
+ */
+export function roundingErrorBound(value: number): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new SignalError(`cannot bound the rounding error of ${value}`);
+  }
+  return 0.5 * 10 ** (Math.floor(Math.log10(value)) - PRICE_SIGNIFICANT_FIGURES + 1);
+}
+
 /** Format a rounded price without exponent notation or trailing zeros. */
 export function formatPrice(value: number): string {
   const rounded = roundPrice(value);
@@ -147,7 +168,7 @@ export function roundPlan(plan: SignalPlan): SignalPlan {
     entryLow: roundPrice(plan.entryLow),
     entryHigh: roundPrice(plan.entryHigh),
     stopPrice: roundPrice(plan.stopPrice),
-    scaleOutPrice: roundPrice(plan.scaleOutPrice),
+    ...(plan.scaleOutPrice === undefined ? {} : { scaleOutPrice: roundPrice(plan.scaleOutPrice) }),
     targetPrice: roundPrice(plan.targetPrice),
     sizePercent: Number(plan.sizePercent.toFixed(2)),
   };
@@ -183,7 +204,8 @@ export function formatSignal(config: Config, plan: SignalPlan): string {
     `${config.publishing.perpHeader} ${p.instId} | ${side} ${leverageFor(p.sizePercent)}x | ` +
     `Entry ${formatPrice(p.entryLow)}-${formatPrice(p.entryHigh)} | ` +
     `SL ${formatPrice(p.stopPrice)} | ` +
-    `TP1 ${formatPrice(p.scaleOutPrice)} | TP2 ${formatPrice(p.targetPrice)} | ` +
+    `${p.scaleOutPrice === undefined ? '' : `TP1 ${formatPrice(p.scaleOutPrice)} | `}` +
+    `TP2 ${formatPrice(p.targetPrice)} | ` +
     `Position ${p.sizePercent}% | Valid ${formatInstant(p.validUntilMs)} | ` +
     `${p.addIndex === undefined ? '' : `ADD ${p.addIndex} | `}${p.signalId}`
   );
@@ -371,7 +393,9 @@ export function validateSignal(
     ['entry low', p.entryLow],
     ['entry high', p.entryHigh],
     ['stop', p.stopPrice],
-    ['TP1 scale-out', p.scaleOutPrice],
+    // TP1 only when the strategy actually has a scale-out. A single-target
+    // strategy publishes no TP1, so there is no price to look for.
+    ...(p.scaleOutPrice === undefined ? [] : ([['TP1 scale-out', p.scaleOutPrice]] as const)),
     ['TP2 target', p.targetPrice],
   ] as const) {
     if (!text.includes(formatPrice(value))) {
@@ -406,13 +430,13 @@ export function validateSignal(
     // TP1 is where 25% actually comes off, so it must be a level the trade
     // reaches BEFORE the screening target. A TP1 beyond TP2 would publish a
     // scale-out that can never fire before the level that justified the trade.
-    if (!(p.scaleOutPrice > p.entryHigh && p.scaleOutPrice < p.targetPrice)) {
+    if (p.scaleOutPrice !== undefined && !(p.scaleOutPrice > p.entryHigh && p.scaleOutPrice < p.targetPrice)) {
       reasons.push('long TP1 must sit above the entry band and below TP2');
     }
   } else {
     if (p.stopPrice <= p.entryHigh) reasons.push('short stop is not above the entry band');
     if (p.targetPrice >= p.entryLow) reasons.push('short target is not below the entry band');
-    if (!(p.scaleOutPrice < p.entryLow && p.scaleOutPrice > p.targetPrice)) {
+    if (p.scaleOutPrice !== undefined && !(p.scaleOutPrice < p.entryLow && p.scaleOutPrice > p.targetPrice)) {
       reasons.push('short TP1 must sit below the entry band and above TP2');
     }
   }
@@ -443,7 +467,20 @@ export function validateSignal(
   const reward = Math.abs(p.targetPrice - entryReference);
   if (risk > 0) {
     const ratio = reward / risk;
-    if (ratio < config.risk.minTargetStopRatio) {
+    // The ratio is computed from PUBLISHED prices, which are quantised to
+    // PRICE_SIGNIFICANT_FIGURES. Risk and reward are differences of two such
+    // prices, so quantisation error is amplified: a stop two ATR from a 64,000
+    // price loses far more relative precision in the difference than in either
+    // price. A strategy that targets exactly the minimum — the frozen policy
+    // targets 3R against a 3.0 floor — would then be refused by rounding alone,
+    // which is a measurement artefact rather than a bad signal.
+    //
+    // So the comparison admits exactly as much slack as rounding can explain,
+    // propagated from the actual magnitudes involved, and not one part more.
+    const tolerance = (roundingErrorBound(p.targetPrice) +
+      (1 + ratio) * roundingErrorBound(entryReference) +
+      ratio * roundingErrorBound(p.stopPrice)) / risk;
+    if (ratio < config.risk.minTargetStopRatio - tolerance) {
       reasons.push(
         `published payoff ratio ${ratio.toFixed(2)} is below the ${config.risk.minTargetStopRatio} minimum`,
       );

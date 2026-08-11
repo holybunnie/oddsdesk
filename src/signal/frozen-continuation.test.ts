@@ -77,7 +77,10 @@ describe('frozen short continuation', () => {
     const candidate = decision.candidate!;
     const risk = candidate.stopPrice - candidate.entryBandLow;
     expect(candidate.entryBandLow - candidate.targetPrice).toBeCloseTo(3 * risk, 10);
-    expect(candidate.scaleOutPrice).toBe(candidate.targetPrice);
+    // No scale-out at all: this is a single 3R target. It previously published
+    // TP1 == TP2, which the publication gate refused, so the policy generated
+    // signals it could never deliver.
+    expect(candidate.scaleOutPrice).toBeUndefined();
   });
 
   it('emits the mirrored long with the stop below and the target above', () => {

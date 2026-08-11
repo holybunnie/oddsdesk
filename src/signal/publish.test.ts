@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { loadConfig } from '../config.js';
+import { parseSignal } from '../execution/copy.js';
 import {
   SignalCycle,
   SignalError,
@@ -327,6 +328,75 @@ describe('TP1 and TP2', () => {
     // the one measured to the screening target.
     expect(reasonsOf(check(plan({ targetPrice: 110 }))).join(' ')).toMatch(/payoff ratio/);
   });
+});
+
+describe('single-target signals', () => {
+  // The frozen continuation policy has no +2R partial: it is one 3R target.
+  // Publishing TP1 == TP2 would tell a subscriber to scale out exactly at the
+  // target, describing an order the strategy never places.
+  const single = (overrides: Partial<SignalPlan> = {}): SignalPlan => {
+    const { scaleOutPrice: _dropped, ...rest } = plan(overrides);
+    return rest;
+  };
+
+  it('omits TP1 entirely rather than publishing it equal to TP2', () => {
+    const text = formatSignal(config, single());
+    expect(text).not.toContain('TP1');
+    expect(text).toContain('TP2 119');
+  });
+
+  it('passes the gate without a TP1', () => {
+    expect(check(single()).ok).toBe(true);
+  });
+
+  it('round-trips back through the parser as a null scale-out', () => {
+    const parsed = parseSignal(config, formatSignal(config, single()));
+    expect(parsed.scaleOutPrice).toBeNull();
+    expect(parsed.targetPrice).toBe(119);
+    expect(parsed.stopPrice).toBe(95);
+  });
+
+  it('still enforces TP1 ordering when a scale-out IS published', () => {
+    // The relaxation must be absent-or-valid, never absent-or-anything.
+    expect(reasonsOf(check(plan({ scaleOutPrice: 125 }))).join(' ')).toMatch(/TP1 must sit above/);
+  });
+
+  it('still enforces the payoff ratio without a TP1', () => {
+    expect(reasonsOf(check(single({ targetPrice: 110 }))).join(' ')).toMatch(/payoff ratio/);
+  });
+});
+
+describe('payoff ratio against published rounding', () => {
+  it('accepts a plan that targets exactly the minimum', () => {
+    // The frozen policy targets 3R against a 3.0 floor. Publication quantises
+    // prices, and risk and reward are DIFFERENCES of quantised prices, so the
+    // ratio drifts by more than either price does. Refusing on that is a
+    // measurement artefact — this is the exact failure that stopped the live
+    // engine publishing its first BNB signal on 2026-08-11.
+    const entry = 613.27;
+    const risk = 2 * 5.113;
+    const p = single_(entry, risk, 3);
+    expect(check(p).ok).toBe(true);
+  });
+
+  it('accepts it at BTC magnitudes, where the difference loses most precision', () => {
+    expect(check(single_(64238.6, 2 * 812.44, 3)).ok).toBe(true);
+  });
+
+  it('still rejects a ratio that is genuinely short of the minimum', () => {
+    // 2.5R is not rounding noise, and must still be refused.
+    expect(reasonsOf(check(single_(613.27, 2 * 5.113, 2.5))).join(' ')).toMatch(/payoff ratio/);
+  });
+
+  function single_(entry: number, risk: number, targetR: number): SignalPlan {
+    const { scaleOutPrice: _dropped, ...rest } = plan({
+      entryLow: entry,
+      entryHigh: entry,
+      stopPrice: entry - risk,
+      targetPrice: entry + targetR * risk,
+    });
+    return rest;
+  }
 });
 
 describe('exit signals', () => {

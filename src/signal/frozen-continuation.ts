@@ -204,7 +204,6 @@ export function evaluateFrozenContinuation(
       entryBandLow: current.close,
       entryBandHigh: current.close,
       stopPrice,
-      scaleOutPrice: targetPrice,
       targetPrice,
       expectedFundingCostFraction: 0,
       atr: atrValue,
