@@ -1,5 +1,56 @@
 # AlphaGate — Handoff
 
+## 14. Session 10 — 2026-08-11 — wallet session restored
+
+**Read this before §13; it resolves §13's single blocker.**
+
+- The engine wallet session is **valid again**. `agent get` returns `ok:true`,
+  and `agent subscribe-active --agent-id 10706` — the exact call that refused
+  every signal all session 9 — returns `ok:true` with the `copyTrade:true`
+  subscription. Wallet is the correct one: `0x4c24a3ef…529a0f05`, login type
+  `google`, account `jennycruzzyy@gmail.com`.
+- The ASP daemon was never touched and stayed active throughout.
+
+### The dev environment loses the SSH key
+
+`~/.ssh/oddsdesk_ed25519` did **not** survive; the dev container was rebuilt.
+A new key (`oddsdesk-session10`) was generated and added to the VPS through the
+**Lightsail browser console**, which is the only path in when no key works.
+Expect to repeat this. Keeping the private key somewhere durable (a laptop)
+avoids it. SSH keys do not expire — an absent key and an expired session are
+different failures with the same symptom of "cannot get in".
+
+When pasting a public key into the browser console, paste it in **short
+chunks** (`K='<base64>'` then `echo "ssh-ed25519 $K <comment>"`). A wrapped
+paste of the full line inserts real newlines and writes a broken three-line
+key, which fails authentication exactly like no key at all.
+
+### The poll trap, corrected — it was never only the timeout
+
+§13 blamed the ~2 minute single-poll timeout. That is real but was **not** what
+defeated this session's first attempts:
+
+1. `nohup`/`setsid` backgrounding through a non-interactive `ssh` command
+   **still died** when the SSH connection closed. Use a supervised transient
+   unit instead, which init owns and no disconnect can reach:
+
+   ```bash
+   sudo systemd-run --unit=oddsdesk-wallet-login --uid=oddsdesk \
+     --setenv=HOME=/opt/oddsdesk --collect bash -c '<poll loop>'
+   ```
+
+2. **The retry loop logged to `/tmp/login.log`, which was owned by another
+   user.** Every iteration died instantly on the shell redirect — `Permission
+   denied` — so 20 "attempts" burned in 40 seconds without ever running a
+   single poll, and the unit exited looking like an honest exhaustion. Write
+   the log somewhere `oddsdesk` owns, and **check the unit's journal, not just
+   its exit status**: `Result=success` with `ExecMainStatus=0` was reported for
+   a loop that never once contacted the venue.
+
+A plain foreground poll against the still-valid session id succeeded
+immediately once the browser sign-in was done. The login URL stays valid across
+failed polls, so re-`init` is rarely needed.
+
 ## 2026-08-10 — competition posture increased to 3% risk
 
 - At the user's explicit direction for a top-three mandate, fixed fractional
